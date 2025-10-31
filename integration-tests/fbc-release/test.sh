@@ -92,6 +92,7 @@ configure_test_matrix() {
     if [[ "$changed_files" =~ pipelines/managed/fbc-release ]] || \
        [[ "$changed_files" =~ tasks/managed/prepare-fbc-parameters ]] || \
        [[ "$changed_files" =~ tasks/managed/add-fbc-contribution ]] || \
+       [[ "$changed_files" =~ tasks/managed/filter-published-fbc-images ]] || \
        [[ "$changed_files" =~ tasks/internal/check-fbc-opt-in ]] || \
        [[ "$changed_files" =~ tasks/internal/update-fbc-catalog-task ]] || \
        [[ "$changed_files" =~ pipelines/internal/check-fbc-opt-in ]] || \
@@ -496,33 +497,86 @@ wait_for_plr_to_complete() {
 
 # --- Snapshot Management ---
 
-# Simple snapshot discovery (no race conditions in controlled test environment)
+# Wait for single-component snapshot with polling and retry logic
 wait_for_single_component_snapshot() {
     echo "📸 Looking for single-component snapshot..." >&2
     echo "🔍 DEBUG: Search context - namespace: ${tenant_namespace}, application: ${application_name}" >&2
     
-    local snapshot_name
-    snapshot_name=$(kubectl get snapshots -n "$tenant_namespace" \
-        -l "appstudio.openshift.io/application=${application_name}" \
-        --sort-by=.metadata.creationTimestamp \
-        -o json 2>/dev/null | jq -r '.items[] | select(.spec.components | length == 1) | .metadata.name' | tail -1)
+    local max_attempts=24  # 12 minutes with 30-second intervals
+    local attempt=1
+    local snapshot_name=""
     
-    if [ -n "$snapshot_name" ]; then
-        echo "🔍 DEBUG: Found single-component snapshot: $snapshot_name" >&2
-    else
-        echo "🔍 DEBUG: No single-component snapshot found" >&2
+    while [ $attempt -le $max_attempts ] && [ -z "$snapshot_name" ]; do
+        if [ $attempt -gt 1 ]; then
+            echo "🔍 DEBUG: Single-component snapshot search attempt ${attempt}/${max_attempts}" >&2
+        fi
         
-        # Show what snapshots are available for debugging
+        # Get all snapshots for the application
         local all_snapshots
         all_snapshots=$(kubectl get snapshots -n "$tenant_namespace" \
             -l "appstudio.openshift.io/application=${application_name}" \
             --sort-by=.metadata.creationTimestamp \
             -o json 2>/dev/null)
         
-        if [ -n "$all_snapshots" ]; then
-            echo "🔍 DEBUG: Available snapshots:" >&2
-            echo "$all_snapshots" | jq -r '.items[] | "  - Name: \(.metadata.name), Created: \(.metadata.creationTimestamp), Components: \(.spec.components | length) (\(.spec.components | map(.name // "unknown") | join(", ")))"' >&2
+        if [ $? -ne 0 ] || [ -z "$all_snapshots" ]; then
+            echo "🔍 DEBUG: Failed to retrieve snapshots or no snapshots found yet" >&2
+            if [ $attempt -lt $max_attempts ]; then
+                echo "🔍 DEBUG: Waiting 30 seconds before retry..." >&2
+                sleep 30
+            fi
+            attempt=$((attempt + 1))
+            continue
         fi
+        
+        # Look for single-component snapshot (1 component)
+        snapshot_name=$(echo "$all_snapshots" | jq -r '.items[] | select(.spec.components | length == 1) | .metadata.name' | tail -1)
+        
+        if [ -n "$snapshot_name" ]; then
+            echo "🔍 DEBUG: Found single-component snapshot: $snapshot_name" >&2
+            
+            # Show detailed info about the found snapshot
+            local snapshot_details
+            snapshot_details=$(echo "$all_snapshots" | jq -r --arg name "$snapshot_name" '.items[] | select(.metadata.name == $name)')
+            echo "🔍 DEBUG: Snapshot details:" >&2
+            echo "$snapshot_details" | jq -r '"  - Created: \(.metadata.creationTimestamp)"' >&2
+            echo "$snapshot_details" | jq -r '"  - Components: \(.spec.components | map(.name) | join(", "))"' >&2
+            break
+        else
+            echo "🔍 DEBUG: No single-component snapshot found yet (need exactly 1 component)" >&2
+            
+            # Show what snapshots are available for debugging
+            if [ -n "$all_snapshots" ]; then
+                echo "🔍 DEBUG: Available snapshots:" >&2
+                echo "$all_snapshots" | jq -r '.items[] | "  - Name: \(.metadata.name), Created: \(.metadata.creationTimestamp), Components: \(.spec.components | length) (\(.spec.components | map(.name // "unknown") | join(", ")))"' >&2
+                
+                # Show component count distribution
+                local component_counts_file=$(mktemp)
+                echo "$all_snapshots" | jq -r '.items[] | .spec.components | length' | sort | uniq -c > "$component_counts_file"
+                if [ -s "$component_counts_file" ]; then
+                    echo "🔍 DEBUG: Component count distribution:" >&2
+                    while read count components; do
+                        echo "    $count snapshot(s) with $components component(s)" >&2
+                    done < "$component_counts_file"
+                fi
+                rm -f "$component_counts_file"
+            fi
+            
+            if [ $attempt -lt $max_attempts ]; then
+                echo "🔍 DEBUG: Waiting 30 seconds before retry..." >&2
+                sleep 30
+            fi
+        fi
+        
+        attempt=$((attempt + 1))
+    done
+    
+    if [ -z "$snapshot_name" ]; then
+        echo "🔴 DEBUG: Failed to find single-component snapshot after ${max_attempts} attempts ($(($max_attempts * 30 / 60)) minutes)" >&2
+        echo "🔴 DEBUG: This may indicate:" >&2
+        echo "    - Single-component snapshots are not being created" >&2
+        echo "    - Snapshot creation is slower than expected" >&2
+        echo "    - Component builds may have failed or not completed properly" >&2
+        echo "    - Integration Service may have issues" >&2
     fi
     
     echo "$snapshot_name"
@@ -826,6 +880,69 @@ verify_multi_component_release() {
     return $failures
 }
 
+# Verify that images actually exist in the registry
+verify_registry_images() {
+    local release_name=$1
+    echo "🔍 Verifying registry images for release: $release_name"
+    
+    local release_json
+    release_json=$(kubectl get release/"${release_name}" -n "${RELEASE_NAMESPACE}" -ojson)
+    
+    local failures=0
+    
+    # Extract and verify index image
+    local index_image_resolved
+    index_image_resolved=$(jq -r '.status.artifacts.index_image.index_image_resolved // ""' <<< "${release_json}")
+    
+    if [ -n "$index_image_resolved" ] && [ "$index_image_resolved" != "null" ]; then
+        echo "  📦 Checking index image: $index_image_resolved"
+        
+        # Skip verification for internal/IIB registries that require special auth
+        if [[ "$index_image_resolved" =~ registry-proxy.*\.redhat\.com|iib\. ]]; then
+            echo "  ⚠️  Index image is in internal registry (skipping accessibility check)"
+            echo "      Internal IIB registries require special authentication not available in e2e tests"
+        elif skopeo inspect --raw "docker://${index_image_resolved}" >/dev/null 2>&1; then
+            echo "  ✅ Index image exists and is accessible in registry"
+        else
+            echo "  🔴 Index image NOT accessible in registry"
+            failures=$((failures+1))
+        fi
+    else
+        echo "  ⚠️  No index_image_resolved found (expected for stage builds)"
+    fi
+    
+    # Extract and verify fragment images
+    local component_count
+    component_count=$(jq '.status.artifacts.components | length' <<< "${release_json}")
+    
+    echo "  📦 Verifying $component_count fragment image(s)..."
+    
+    for ((i=0; i<component_count; i++)); do
+        local fbc_fragment
+        fbc_fragment=$(jq -r ".status.artifacts.components[$i].fbc_fragment // \"\"" <<< "${release_json}")
+        
+        if [ -n "$fbc_fragment" ] && [ "$fbc_fragment" != "null" ]; then
+            echo "    Fragment $((i+1))/$component_count: $fbc_fragment"
+            if skopeo inspect --raw "docker://${fbc_fragment}" >/dev/null 2>&1; then
+                echo "    ✅ Fragment image exists and is accessible in registry"
+            else
+                echo "    🔴 Fragment image NOT accessible in registry"
+                failures=$((failures+1))
+            fi
+        else
+            echo "    ⚠️  Fragment $((i+1))/$component_count has no fbc_fragment"
+        fi
+    done
+    
+    if [ $failures -eq 0 ]; then
+        echo "  ✅ All registry images verified successfully"
+    else
+        echo "  🔴 Registry verification failed: $failures image(s) not accessible"
+    fi
+    
+    return $failures
+}
+
 # Scenario-specific verification functions
 verify_staging_behavior() {
     local release_name=$1
@@ -845,6 +962,21 @@ verify_hotfix_tagging() {
     local release_name=$1
     echo "🔍 Verifying hotfix tagging for: $release_name"
     # Add hotfix-specific verification logic here
+    return 0
+}
+
+verify_idempotence_first() {
+    local release_name=$1
+    echo "🔍 Verifying idempotence-first scenario (initial push): $release_name"
+    # For the first idempotence release, verify images were pushed to registry
+    verify_registry_images "$release_name"
+    return $?
+}
+
+verify_idempotence_second() {
+    local release_name=$1
+    echo "🔍 Verifying idempotence-second scenario (duplicate): $release_name"
+    # The second idempotence release should be filtered out (verified elsewhere)
     return 0
 }
 
@@ -892,6 +1024,12 @@ verify_release_contents() {
         # Scenario-specific verification
         local scenario_result=0
         case "$scenario" in
+            "happy")
+                # For initial push scenarios, verify images exist in registry
+                echo "  🔍 Verifying registry images (initial push)..."
+                verify_registry_images "$release_name"
+                scenario_result=$?
+                ;;
             "staged") 
                 verify_staging_behavior "$release_name" 
                 scenario_result=$?
@@ -902,6 +1040,16 @@ verify_release_contents() {
                 ;;  
             "hotfix") 
                 verify_hotfix_tagging "$release_name"
+                scenario_result=$?
+                ;;
+            "first")
+                # Idempotence first release - verify images pushed
+                verify_idempotence_first "$release_name"
+                scenario_result=$?
+                ;;
+            "second")
+                # Idempotence second release - verify filtering worked
+                verify_idempotence_second "$release_name"
                 scenario_result=$?
                 ;;
         esac
@@ -922,6 +1070,106 @@ verify_release_contents() {
     fi
 }
 
+# Create idempotence test releases (to be called BEFORE other releases)
+test_idempotence_create_releases() {
+    echo ""
+    echo "🔄 Creating Idempotence Test Releases (Double Release Scenario)"
+    echo ""
+    echo "This test validates that re-releasing the same snapshot filters out"
+    echo "already-published components, ensuring true idempotent behavior."
+    echo ""
+    echo "Strategy: Creating both releases NOW (before other tests) ensures"
+    echo "the first release works with a fresh, unpublished snapshot."
+    echo ""
+    echo "Note: Using multi-component snapshot to test batching and deduplication"
+    echo "      in the idempotence scenario (more realistic and comprehensive)."
+    echo ""
+    
+    local snapshot_name
+    snapshot_name=$(wait_for_multi_component_snapshot)
+    
+    if [ -z "$snapshot_name" ]; then
+        echo "🔴 Failed to find multi-component snapshot for idempotence test"
+        return 1
+    fi
+    
+    echo "📦 Using multi-component snapshot: ${snapshot_name}"
+    
+    local release_plan="fbc-release-happy-rp-${uuid}"
+    echo "📋 Using ReleasePlan: ${release_plan}"
+    echo ""
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📤 Creating FIRST idempotence release"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Generate unique suffix for idempotence test releases
+    local idempotence_suffix="${uuid}"
+    local release1="idempotence-test-first-${idempotence_suffix}"
+    echo "Creating: ${release1}"
+    
+    kubectl create -f - <<EOF
+apiVersion: appstudio.redhat.com/v1alpha1
+kind: Release
+metadata:
+  name: ${release1}
+  namespace: ${tenant_namespace}
+spec:
+  releasePlan: ${release_plan}
+  snapshot: ${snapshot_name}
+EOF
+    
+    if [ $? -ne 0 ]; then
+        echo "🔴 Failed to create first idempotence release"
+        return 1
+    fi
+    
+    RELEASES_TO_VERIFY["$release1"]="multi-first"
+    echo "✅ First idempotence release created: ${release1}"
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "📤 Creating SECOND idempotence release (after 90s delay)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    echo "⏳ Waiting 90 seconds for first release to publish to Pyxis..."
+    echo "   (Allows publish-index-image task to complete and Pyxis to propagate)"
+    sleep 90
+    
+    local release2="idempotence-test-second-${idempotence_suffix}"
+    echo "Creating: ${release2}"
+    echo "📦 Using SAME snapshot: ${snapshot_name}"
+    
+    kubectl create -f - <<EOF
+apiVersion: appstudio.redhat.com/v1alpha1
+kind: Release
+metadata:
+  name: ${release2}
+  namespace: ${tenant_namespace}
+spec:
+  releasePlan: ${release_plan}
+  snapshot: ${snapshot_name}
+EOF
+    
+    if [ $? -ne 0 ]; then
+        echo "🔴 Failed to create second idempotence release"
+        return 1
+    fi
+    
+    RELEASES_TO_VERIFY["$release2"]="multi-second"
+    echo "✅ Second idempotence release created: ${release2}"
+    
+    IDEMPOTENCE_RELEASE_1="${release1}"
+    IDEMPOTENCE_RELEASE_2="${release2}"
+    
+    echo ""
+    echo "✅ Both idempotence test releases created successfully!"
+    echo "   First:  ${release1}"
+    echo "   Second: ${release2}"
+    echo "   They will run in parallel with the main test releases."
+    echo ""
+}
+
 # Configure test matrix early for consistency (components always built as dual)
 configure_test_matrix_early() {
     echo "🔧 Configuring test matrix early for consistency..."
@@ -938,6 +1186,17 @@ wait_for_releases() {
     # Add a small delay to ensure any snapshot creation has time to complete
     echo "🔍 DEBUG: Waiting 30 seconds for any final snapshot updates..."
     sleep 30
+    
+    # Run idempotence test FIRST (before other releases) to use fresh snapshot
+    echo ""
+    echo "======================================================================="
+    echo "🎯 Running Idempotence Test FIRST (with fresh snapshot)"
+    echo "======================================================================="
+    
+    if ! test_idempotence_create_releases; then
+        echo "🔴 Failed to create idempotence test releases"
+        exit 1
+    fi
     
     echo "🔍 DEBUG: Calling trigger_configured_releases() now..."
     trigger_configured_releases
