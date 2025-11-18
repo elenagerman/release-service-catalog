@@ -162,12 +162,13 @@ is_taskrun_skipped() {
     local pipelinerun_name
     pipelinerun_name=$(basename "${pipelinerun_full}")
 
-    local status
-    status=$(kubectl get taskrun -n "${managed_namespace}" \
-        -l "tekton.dev/pipelineRun=${pipelinerun_name},tekton.dev/pipelineTask=${task_name}" \
-        -o jsonpath='{.items[0].status.conditions[0].reason}' 2>/dev/null)
+    # Check if task appears in PipelineRun's skippedTasks list
+    # Skipped tasks don't create TaskRuns, they're only in the PipelineRun status
+    local skipped_task
+    skipped_task=$(kubectl get pipelinerun "${pipelinerun_name}" -n "${managed_namespace}" \
+        -o jsonpath="{.status.skippedTasks[?(@.name=='${task_name}')].name}" 2>/dev/null)
 
-    [[ "${status}" == "Skipped" ]]
+    [[ -n "${skipped_task}" ]]
 }
 
 
