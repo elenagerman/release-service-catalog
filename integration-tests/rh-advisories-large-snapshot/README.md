@@ -1,4 +1,5 @@
 # rh-advisories-large-snapshot test
+
 ## Setup
 
 ### Dependencies
@@ -51,7 +52,8 @@ This test can be triggered manually via PR comment:
 /test-large-snapshot
 ```
 
-Comment on any PR. The PaC configuration ([.tekton/rh-advisories-large-snapshot.yaml](../../.tekton/rh-advisories-large-snapshot.yaml)) will trigger the Tekton pipeline automatically.
+Comment on any PR. The PaC configuration ([.tekton/rh-advisories-large-snapshot.yaml](../../.tekton/rh-advisories-large-snapshot.yaml)) 
+will trigger the Tekton pipeline automatically.
 
 The pipeline runs in the cluster and uses existing Kubernetes secrets (vault-password-secret, github-token-secret, kubeconfig-secret).
 
