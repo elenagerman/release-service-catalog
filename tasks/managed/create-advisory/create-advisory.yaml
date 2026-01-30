@@ -157,7 +157,7 @@ spec:
         - name: sourceDataArtifact
           value: $(params.sourceDataArtifact)
     - name: update-purl
-      image: quay.io/konflux-ci/release-service-utils@sha256:653b4782f0693c031a5d1327c026e6895d90b8126d51d8a3d07ffe940f6721fd
+      image: quay.io/konflux-ci/release-service-utils@sha256:5546fa78d3c88d7b6a2e8cff8902f7757f00541d0bbaf113b9f293133894afa3
       computeResources:
         limits:
           memory: 256Mi
@@ -326,7 +326,7 @@ spec:
           .releaseNotes.content.artifacts = $updated
         ' "$DATA_FILE" > /tmp/data.tmp && mv /tmp/data.tmp "$DATA_FILE"
     - name: run-script
-      image: quay.io/konflux-ci/release-service-utils@sha256:653b4782f0693c031a5d1327c026e6895d90b8126d51d8a3d07ffe940f6721fd
+      image: quay.io/konflux-ci/release-service-utils@sha256:5546fa78d3c88d7b6a2e8cff8902f7757f00541d0bbaf113b9f293133894afa3
       computeResources:
         limits:
           memory: 512Mi
@@ -370,7 +370,9 @@ spec:
 
         DATA_FILE="$(params.dataDir)/$(params.dataPath)"
 
-        content_type=$(jq -r '.mapping.components[]?.contentGateway?.contentType // empty' "$DATA_FILE" | head -n1)
+        # Try to extract the first contentType if it exists
+        content_type=$(jq -r '.mapping.components[]? |
+          (.contentGateway?.contentType // .contentType) // empty' "$DATA_FILE" | head -n1)
 
         # if no content type, check if this is a github release by looking for .github in data.json
         if [ -z "$content_type" ]; then
@@ -382,7 +384,7 @@ spec:
           fi
         fi
 
-        if [ "$content_type" = "binary" ] || [ "$content_type" = "generic" ] || [ "$content_type" = "disk-image" ]; then
+        if [[ "$content_type" =~ ^(binary|generic|disk-image|rpm)$ ]] ; then
           content_path=".content.artifacts"
         else
           content_path=".content.images"

@@ -2,12 +2,12 @@
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
-  name: test-collect-mrrc-params-fail-no-snapshot
+  name: test-publish-to-mrrc-failure-no-charon-file
   annotations:
     test/assert-task-failure: "run-task"
 spec:
   description: |
-    Run the collect-mrrc-params task with no snapshot file and verify the taks fails as expected
+    Run the publish-to-mrrc task without mrrc.env file
   params:
     - name: ociStorage
       description: The OCI repository where the Trusted Artifacts are stored.
@@ -48,27 +48,23 @@ spec:
               value: "$(params.orasOptions)"
             - name: "DEBUG"
               value: "$(params.trustedArtifactsDebug)"
+          # This is a workaround for a problem observed on Konflux clusters where the
+          # a step runs with root user causing a file or folder to not be readable
+          # in later steps. There might be solution coming related to the
+          # security context constraints on the cluster, but setting this explicitly here
+          # should probably be harmless either way.
+          securityContext:
+            runAsUser: 1001
         steps:
           - name: setup-values
-            image: quay.io/konflux-ci/release-service-utils@sha256:653b4782f0693c031a5d1327c026e6895d90b8126d51d8a3d07ffe940f6721fd
+            image: quay.io/konflux-ci/release-service-utils@sha256:5546fa78d3c88d7b6a2e8cff8902f7757f00541d0bbaf113b9f293133894afa3
             script: |
-              #!/usr/bin/env sh
+              #!/usr/bin/env bash
               set -eux
 
               mkdir -p "$(params.dataDir)/$(context.pipelineRun.uid)"
-              cat > "$(params.dataDir)/$(context.pipelineRun.uid)/data.json" << EOF
-              {
-                "releaseNotes": {
-                  "product_name": "test",
-                  "product_version": "0.0.1"
-                },
-                "mrrc": {
-                  "charonConfig":"charon-config",
-                  "awsSecret": "charon-aws-credentials",
-                  "environment": "dev",
-                  "release": "ga"
-                }
-              }
+              cat > "$(params.dataDir)/$(context.pipelineRun.uid)"/charon-config.yaml << EOF
+              charon-config
               EOF
           - name: create-trusted-artifact
             ref:
@@ -82,12 +78,14 @@ spec:
                 value: $(results.sourceDataArtifact.path)
     - name: run-task
       taskRef:
-        name: collect-mrrc-params
+        name: publish-to-mrrc
       params:
-        - name: dataJsonPath
-          value: $(context.pipelineRun.uid)/data.json
-        - name: snapshotPath
-          value: $(context.pipelineRun.uid)/snapshot_spec.json
+        - name: charonParamFilePath
+          value: $(context.pipelineRun.uid)/charon.env
+        - name: charonConfigFilePath
+          value: $(context.pipelineRun.uid)/charon-config.yaml
+        - name: charonAWSSecret
+          value: test-charon-aws-credentials
         - name: ociStorage
           value: $(params.ociStorage)
         - name: orasOptions
@@ -102,7 +100,7 @@ spec:
           value: "http://localhost"
         - name: taskGitRevision
           value: "main"
-        - name: releasePath
-          value: $(context.pipelineRun.uid)/release.json
+        - name: charonSignCASecret
+          value: test-ca
       runAfter:
         - setup

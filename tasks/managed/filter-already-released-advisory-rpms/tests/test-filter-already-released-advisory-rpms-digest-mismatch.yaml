@@ -2,12 +2,13 @@
 apiVersion: tekton.dev/v1
 kind: Pipeline
 metadata:
-  name: test-collect-mrrc-params-fail-no-data
+  name: test-filter-already-released-advisory-rpms-digest-mismatch
   annotations:
     test/assert-task-failure: "run-task"
 spec:
   description: |
-    Run the collect-mrrc-params task with no data file and verify the taks fails as expected
+    Run filter-already-released-advisory-rpms where RPM exists in Pulp for the same NEVRA but digest differs.
+    The task should fail.
   params:
     - name: ociStorage
       description: The OCI repository where the Trusted Artifacts are stored.
@@ -42,27 +43,30 @@ spec:
             - mountPath: /var/workdir
               name: workdir
           env:
+            - name: HOME
+              value: /var/workdir
             - name: IMAGE_EXPIRES_AFTER
               value: $(params.ociArtifactExpiresAfter)
-            - name: "ORAS_OPTIONS"
+            - name: ORAS_OPTIONS
               value: "$(params.orasOptions)"
-            - name: "DEBUG"
+            - name: DEBUG
               value: "$(params.trustedArtifactsDebug)"
         steps:
           - name: setup-values
-            image: quay.io/konflux-ci/release-service-utils@sha256:653b4782f0693c031a5d1327c026e6895d90b8126d51d8a3d07ffe940f6721fd
+            image: quay.io/konflux-ci/release-service-utils@sha256:304058ae848ca6311b53b505e80533fc337e9c1a46dedd4071ee436b14e476d9  # yamllint disable-line rule:line-length
             script: |
-              #!/usr/bin/env sh
+              #!/usr/bin/env bash
               set -eux
 
               mkdir -p "$(params.dataDir)/$(context.pipelineRun.uid)"
               cat > "$(params.dataDir)/$(context.pipelineRun.uid)/snapshot_spec.json" << EOF
               {
-                "application": "test",
+                "application": "rpms",
+                "artifacts": {},
                 "components": [
                   {
-                    "containerImage": "quay.io/test/test.zip@sha256:02b0c8aadf2b7c69",
-                    "name": "test-0.0.1"
+                    "containerImage": "quay.io/test/digestmismatch@sha256:12345",
+                    "name": "test"
                   }
                 ]
               }
@@ -79,12 +83,14 @@ spec:
                 value: $(results.sourceDataArtifact.path)
     - name: run-task
       taskRef:
-        name: collect-mrrc-params
+        name: filter-already-released-advisory-rpms
       params:
-        - name: dataJsonPath
-          value: $(context.pipelineRun.uid)/data.json
         - name: snapshotPath
-          value: $(context.pipelineRun.uid)/snapshot_spec.json
+          value: "$(context.pipelineRun.uid)/snapshot_spec.json"
+        - name: PULP_DOMAIN
+          value: "mydomain"
+        - name: PULP_SECRET_NAME
+          value: "pulp-task-pulp-secret"
         - name: ociStorage
           value: $(params.ociStorage)
         - name: orasOptions
@@ -99,7 +105,5 @@ spec:
           value: "http://localhost"
         - name: taskGitRevision
           value: "main"
-        - name: releasePath
-          value: $(context.pipelineRun.uid)/release.json
       runAfter:
         - setup
