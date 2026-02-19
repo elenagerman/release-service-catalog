@@ -4,11 +4,11 @@
 #
 # MAXIMUM STRESS TEST - Tests rh-advisories pipeline with worst-case configuration:
 # - 200 fresh Konflux multi-arch builds (4 architectures: amd64, arm64, s390x, ppc64le)
-# - Expected duration: 
-#     Every run: 10-13 hours total (120-180 min build + 8-11 hours signing)
-#     (Components cleaned up after each run to ensure worst-case signing performance)
+# - Expected duration:
+#     First run: 10-13 hours total (120-180 min build + 8-11 hours signing)
+#     Subsequent runs: 4-5 hours (components recovered from Quay, no build needed)
 # - Tests: Signing service capacity, production-scale multi-arch component processing
-# - Configuration: 4-arch builds, NO idempotency, NO SBOM, STRICT EC validation
+# - Configuration: 4-arch builds, component recovery from Quay, STRICT EC validation
 #
 # USAGE:
 #   # Default: Smart build (reuses existing images, builds missing ones)
@@ -24,11 +24,11 @@
 #   # No batching delays needed - builds start only after ALL components are ready
 #   # Retry logic with exponential backoff handles any GitHub API rate limit errors
 #
-#   # Keep components for fast re-runs (default: true for worst-case signing every run)
-#   CLEANUP_TEST_COMPONENTS=false ./test.sh
-#
 #   # Advanced: Skip build entirely (use pre-existing image pool file)
 #   SKIP_BUILD=true FRESH_BUILDS_FILE=/path/to/existing ./test.sh
+#
+#   # Note: Components are NOT cleaned up after tests - they persist for fast recovery
+#   #       Images on Quay.io remain even after component deletion
 #
 # For general test infrastructure and requirements, see:
 #   integration-tests/README.md (common setup, cluster architecture, secrets)
@@ -45,7 +45,7 @@ COMPONENT_COUNT="${COMPONENT_COUNT:-200}"
 NAMESPACE="${NAMESPACE:-dev-release-team-tenant}"
 FRESH_BUILDS_FILE="${FRESH_BUILDS_FILE:-/tmp/fresh-images-pool-$(date +%s).txt}"
 SKIP_BUILD="${SKIP_BUILD:-false}"
-CLEANUP_TEST_COMPONENTS="${CLEANUP_TEST_COMPONENTS:-true}"  # Default: cleanup after test for worst-case signing on every run
+# Note: Component cleanup is disabled - components persist for fast recovery from Quay images
 
 # --- Build Phase (if needed) ---
 if [ "${SKIP_BUILD}" = "false" ]; then
@@ -993,36 +993,11 @@ cleanup_resources() {
             echo "   ✓ No test releases found"
         fi
 
-        # Clean up test Applications and Components (if enabled)
-        if [ "${CLEANUP_TEST_COMPONENTS}" == "true" ] && [ "${SKIP_BUILD}" == "false" ]; then
-            echo "🗑️  Cleaning up test Applications and Components..."
-            
-            # Find and delete all multi-version-build applications (cascade deletes components)
-            local fresh_apps
-            fresh_apps=$(kubectl get application -n "${NAMESPACE:-dev-release-team-tenant}" \
-                -l "test.appstudio.openshift.io/type=multi-version-build" \
-                --no-headers 2>/dev/null | awk '{print $1}' || echo "")
-            
-            if [ -n "${fresh_apps}" ]; then
-                local app_count
-                app_count=$(echo "${fresh_apps}" | wc -l)
-                echo "   Found ${app_count} fresh build applications to clean up"
-                
-                while IFS= read -r app; do
-                    if kubectl delete application "${app}" -n "${NAMESPACE:-dev-release-team-tenant}" 2>/dev/null; then
-                        echo "   ✓ Deleted ${app} (components cascade-deleted)"
-                    else
-                        echo "   ⚠ Failed to delete ${app}"
-                    fi
-                done <<< "${fresh_apps}"
-            else
-                echo "   ✓ No fresh build applications found"
-            fi
-        elif [ "${SKIP_BUILD}" == "true" ]; then
-            echo "⏩ Skipping component cleanup (SKIP_BUILD=true)"
-        else
-            echo "⏩ Skipping component cleanup (CLEANUP_TEST_COMPONENTS=false)"
-        fi
+        # Component cleanup is DISABLED
+        # Components persist across test runs to enable image reuse from Quay
+        # Images on Quay.io are NOT deleted when components are deleted
+        # This allows fast recovery: create components pointing to existing Quay images
+        echo "⏩ Component cleanup disabled - components will persist for fast recovery"
 
         # Standard cleanup
         if [ -n "$tmpDir" ] && [ -d "$tmpDir" ]; then
@@ -1082,6 +1057,81 @@ apply_kustomize_resources() {
     echo "✅ ${description} applied to ${namespace}" >&2
 }
 
+# Function to patch RPA with actual component names from snapshot
+# The apply-mapping task does NOT support wildcard "*" matching
+patch_rpa_with_snapshot_components() {
+    # Validate required variables
+    : "${large_snapshot_name:?large_snapshot_name must be set}"
+    : "${tenant_namespace:?tenant_namespace must be set}"
+    : "${managed_namespace:?managed_namespace must be set}"
+    : "${release_plan_admission_name:?release_plan_admission_name must be set}"
+    
+    echo "Generating component mapping from snapshot..." >&2
+    
+    # Get component names from snapshot
+    local components
+    components=$(kubectl get snapshot "${large_snapshot_name}" -n "${tenant_namespace}" \
+        -o jsonpath='{range .spec.components[*]}{.name}{"\n"}{end}')
+    
+    if [ -z "${components}" ]; then
+        echo "❌ No components found in snapshot ${large_snapshot_name}" >&2
+        return 1
+    fi
+    
+    local component_count
+    component_count=$(echo "${components}" | wc -l)
+    echo "  Found ${component_count} components in snapshot" >&2
+    
+    # Build the mapping components array as JSON
+    local mapping_json='[]'
+    while IFS= read -r component_name; do
+        [ -z "${component_name}" ] && continue
+        local component_entry=$(cat <<EOF
+{
+  "name": "${component_name}",
+  "repositories": [
+    {
+      "url": "quay.io/redhat-pending/rhtap----rh-advisories-component"
+    }
+  ]
+}
+EOF
+)
+        mapping_json=$(echo "${mapping_json}" | jq --argjson entry "${component_entry}" '. += [$entry]')
+    done <<< "${components}"
+    
+    echo "  Generated mapping for ${component_count} components" >&2
+    
+    # Patch the RPA with the new mapping
+    echo "  Patching ReleasePlanAdmission: ${release_plan_admission_name}" >&2
+    
+    local patch_json=$(cat <<EOF
+{
+  "spec": {
+    "data": {
+      "mapping": {
+        "components": ${mapping_json}
+      }
+    }
+  }
+}
+EOF
+)
+    
+    kubectl patch releaseplanadmission "${release_plan_admission_name}" \
+        -n "${managed_namespace}" \
+        --type merge \
+        -p "${patch_json}"
+    
+    if [ $? -ne 0 ]; then
+        echo "❌ Failed to patch ReleasePlanAdmission" >&2
+        return 1
+    fi
+    
+    echo "✅ ReleasePlanAdmission patched with ${component_count} component mappings" >&2
+    return 0
+}
+
 # Override: Resource creation with large snapshot
 create_kubernetes_resources() {
     # Validate required variables
@@ -1136,6 +1186,16 @@ create_kubernetes_resources() {
     apply_large_snapshot
     if [ $? -ne 0 ]; then
         echo "❌ Failed to apply large snapshot" >&2
+        return 1
+    fi
+
+    # CRITICAL: Patch RPA with actual component names from snapshot
+    # The apply-mapping task does NOT support wildcard "*" patterns
+    # It requires exact component name matches via group_by(.name)
+    echo "Patching ReleasePlanAdmission with snapshot component mappings..." >&2
+    patch_rpa_with_snapshot_components
+    if [ $? -ne 0 ]; then
+        echo "❌ Failed to patch RPA with component mappings" >&2
         return 1
     fi
 

@@ -82,10 +82,11 @@ spec:
               storage: 2Gi
   
   # Extended timeout for large snapshot tests
-  # NOTE: Build phase is SKIPPED (SKIP_BUILD=true)
-  #       Images must be pre-built using /build-large-snapshot
-  # Test verifies existing images and runs release pipeline
-  # Expected duration: 4-5 hours (signing + advisory + verification)
+  # NOTE: Build phase is SKIPPED by default (SKIP_BUILD defaults to "true")
+  #       Components are recovered from existing Quay images
+  #       Use /build-large-snapshot to build new images if needed
+  # Test recovers components from Quay and runs release pipeline
+  # Expected duration: 4-5 hours (recovery + signing + advisory + verification)
   timeouts:
     pipeline: 9h0m0s
     tasks: 9h0m0s  # Set task timeout to match pipeline timeout
@@ -141,6 +142,8 @@ spec:
         }
     - name: PIPELINE_TEST_SUITE
       value: "rh-advisories-large-snapshot"
+    - name: SKIP_BUILD
+      value: "false"  # Enable build phase for /build-large-snapshot
     - name: TARGET_COMPONENTS
       value: "200"
     - name: FORCE_REBUILD

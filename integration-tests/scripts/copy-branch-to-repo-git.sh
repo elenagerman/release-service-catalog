@@ -143,6 +143,16 @@ cd source-repo
 
 # Checkout the source branch
 echo "Checking out source branch ${source_branch}..."
+
+# First verify the branch exists on remote
+if ! git ls-remote --heads origin "${source_branch}" | grep -q "${source_branch}"; then
+  echo "🔴 error: source branch '${source_branch}' does not exist in ${source_repo}" >&2
+  echo "   Available branches:" >&2
+  git branch -r | head -20 >&2
+  exit 1
+fi
+
+# Checkout the branch - git will auto-track from origin if needed
 git checkout "${source_branch}"
 
 # Add destination repo as a remote

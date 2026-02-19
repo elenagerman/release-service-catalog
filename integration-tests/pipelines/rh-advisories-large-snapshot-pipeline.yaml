@@ -10,6 +10,10 @@ spec:
     - name: PIPELINE_TEST_SUITE
       type: string
       description: 'The name of the test corresponding to a defined Konflux integration test.'
+    - name: SKIP_BUILD
+      type: string
+      default: 'true'
+      description: 'Skip build phase (true = test with existing images, false = build images first)'
     - name: VAULT_PASSWORD_SECRET_NAME
       default: 'e2e-test-vault-password'
       type: string
@@ -87,7 +91,7 @@ spec:
               - name: SKIP_BUILD
                 # "false" = Enable build phase (can rebuild components)
                 # "true" = Skip build phase entirely (reuse existing)
-                value: "false"
+                value: $(params.SKIP_BUILD)
               - name: FORCE_REBUILD
                 # "true" = Force rebuild ALL components (creates new digests, worst-case signing)
                 # "false" = Reuse existing successful builds (fast but may have existing signatures)
@@ -232,33 +236,54 @@ spec:
               # Conditional validation: Only validate existing images if we're reusing (not rebuilding)
               # If SKIP_BUILD=false, we'll build fresh images, so validation happens AFTER build
               if [ "${SKIP_BUILD}" = "true" ]; then
-                # Validate existing components and collect images (no building)
-                # IMPORTANT: This runs immediately before test execution to ensure
-                # all images still exist on Quay.io (validates manifests, not just metadata)
-                FRESH_BUILDS_FILE="/tmp/validated-images-pool-$(date +%s).txt"
+                # Recovery mode: Recreate components from existing Quay images (no building)
+                # IMPORTANT: Images persist on Quay even after components are deleted
+                # This recovers all components by checking Quay and creating components for found images
+                FRESH_BUILDS_FILE="/tmp/recovered-images-pool-$(date +%s).txt"
                 export FRESH_BUILDS_FILE
-                export CI=true  # Skip interactive prompts in test.sh
-                MIN_IMAGES=50  # Minimum required images to run test
+                export CI=true  # Skip interactive prompts
+                TARGET_COMPONENTS=200  # Target to recover
                 
                 echo ""
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                echo "Validating Existing Components (REUSE mode - no building)"
+                echo "🔄 Component Recovery (REUSE mode - no building)"
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                echo "  NOTE: Verifying image manifests exist on Quay.io"
+                echo "  NOTE: Recovering components from existing Quay images"
+                echo "  Will scan Quay.io and create components for all found images"
                 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 echo ""
                 
-                # Script will fail if < 50 images found (also verifies manifests exist)
-                "/home/e2e/tests/$(params.PIPELINE_TEST_SUITE)/utils/validate-and-collect-images.sh" \
+                # Run build-images.sh in recovery mode (SKIP_BUILD=true)
+                # This will:
+                #   1. Find existing components with valid images
+                #   2. Scan Quay for images without components (recovery!)
+                #   3. Create new components pointing to found images
+                #   4. Skip creating components that need building (no image on Quay)
+                "/home/e2e/tests/$(params.PIPELINE_TEST_SUITE)/utils/build-images.sh" \
+                  "${TARGET_COMPONENTS}" \
                   "dev-release-team-tenant" \
                   "${FRESH_BUILDS_FILE}" \
-                  "${MIN_IMAGES}"
+                  "false" \
+                  "true"
                 
                 COMPONENT_COUNT=$(wc -l < "${FRESH_BUILDS_FILE}")
                 export COMPONENT_COUNT
                 export LARGE_SNAPSHOT_COMPONENT_COUNT="${COMPONENT_COUNT}"  # Tell test to expect this count
+                
+                # Fail if we didn't recover enough images
+                MIN_IMAGES=50
+                if [ "${COMPONENT_COUNT}" -lt "${MIN_IMAGES}" ]; then
+                  echo ""
+                  echo "❌ ERROR: Not enough images recovered!"
+                  echo "   Found: ${COMPONENT_COUNT} images"
+                  echo "   Required: At least ${MIN_IMAGES} images"
+                  echo ""
+                  echo "   Run /build-large-snapshot to build more images"
+                  exit 1
+                fi
+                
                 echo ""
-                echo "✅ Validated ${COMPONENT_COUNT} images ready for testing"
+                echo "✅ Recovered ${COMPONENT_COUNT} components with images ready for testing"
                 echo ""
               else
                 echo ""

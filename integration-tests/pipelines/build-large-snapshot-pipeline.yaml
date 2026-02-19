@@ -132,8 +132,9 @@ spec:
               
               export COMPONENT_COUNT
               export NAMESPACE="dev-release-team-tenant"
-              # Override template branch (exists in repo)
-              export PAC_TEMPLATE_BRANCH="konflux-v4-15-apiserver-watcher-01"
+              # Override template branch (use existing branch from previous runs)
+              # Note: konflux-v4-15-apiserver-watcher-01 doesn't exist (only -27 for v4-15)
+              export PAC_TEMPLATE_BRANCH="konflux-ls-v4-16-apiserver-watcher-01"
               # GITHUB_TOKEN is already set from env above
               
               # Run the build script (4th param controls force_rebuild)

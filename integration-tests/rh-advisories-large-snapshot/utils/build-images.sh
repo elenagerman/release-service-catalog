@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+# Error trap for debugging - log which line/command failed
+trap 'echo "❌ ERROR at line $LINENO: Command failed with exit code $?" >&2' ERR
+
 # ============================================================================
 # build-images.sh - Ensure Konflux components exist with images
 # ============================================================================
@@ -18,7 +21,7 @@ set -euo pipefail
 #   4. Stop when N components exist
 #   5. Build only components missing images (PAC auto-triggers on creation)
 #   6. Wait for builds to complete
-#   7. Patch component specs with Quay digests
+#   7. Patch component specs with digests (from status.lastPromotedImage)
 #   8. Output image pool file
 #
 # INCREMENTAL BUILD FORMULA:
@@ -27,17 +30,19 @@ set -euo pipefail
 #   - If existing == target:    do nothing
 #
 # USAGE:
-#   ./build-images.sh [component_count] [namespace] [output_file] [force_rebuild]
+#   ./build-images.sh [component_count] [namespace] [output_file] [force_rebuild] [skip_build]
 #
 #   IMPORTANT: Build time depends on target count (30s delays between each component creation).
 #              Subsequent runs complete in 30-60 seconds by reusing existing builds!
 #              Use force_rebuild=true to disable image reuse and create fresh builds.
+#              Use skip_build=true for repair-only mode (no new builds triggered).
 #
 # ARGUMENTS:
 #   component_count : Target total components (default: 200)
 #   namespace       : Kubernetes namespace for builds (default: dev-release-team-tenant)
 #   output_file     : Output file for image pool (default: /tmp/images-pool-TIMESTAMP.txt)
 #   force_rebuild   : Force fresh builds, disable image reuse (default: false, set to 'true' to force)
+#   skip_build      : Repair-only mode, don't build new images (default: false, set to 'true' for repair-only)
 #
 # ENVIRONMENT:
 #   GITHUB_TOKEN        : Required! GitHub PAT with 'repo' permissions for creating branches
@@ -45,7 +50,7 @@ set -euo pipefail
 #   BUILD_TIMEOUT       : Total timeout in seconds (default: 5400 = 90 min, use 10800 for 300-1.5GB images)
 #   CHECK_INTERVAL      : Status check interval in seconds (default: 30)
 #   BASE_REPO           : GitHub repository for component source (default: hacbs-release-tests/e2e-base)
-#   PAC_TEMPLATE_BRANCH : Branch with PAC config to copy (default: konflux-v4-15-apiserver-watcher-01)
+#   PAC_TEMPLATE_BRANCH : Branch with PAC config to copy (default: konflux-ls-v4-16-apiserver-watcher-01)
 #   BASE_BRANCH         : Fallback branch (deprecated, use PAC_TEMPLATE_BRANCH)
 #
 # OUTPUT:
@@ -105,6 +110,9 @@ set -euo pipefail
 #   # Force fresh builds (disable image reuse from Quay) - all components rebuilt
 #   ./build-images.sh 200 dev-release-team-tenant /tmp/output.txt true
 #
+#   # Repair-only mode: fix existing components, don't build new ones (fails if < 200)
+#   ./build-images.sh 200 dev-release-team-tenant /tmp/output.txt false true
+#
 #   # Target only 100 total components (useful for smaller tests)
 #   ./build-images.sh 100
 #
@@ -113,6 +121,22 @@ set -euo pipefail
 #
 #   # Custom parallel builds and faster checks
 #   PARALLEL_BUILDS=100 CHECK_INTERVAL=15 ./build-images.sh
+#
+# RUNNING VIA PR COMMENT:
+#   This script is automatically executed when triggered via PR comment on GitHub.
+#
+#   To trigger the full test (including this script) from a Pull Request:
+#     1. Create a PR targeting the 'development' branch
+#     2. Add a comment with: /test-large-snapshot
+#     3. The test pipeline will run automatically in rhtap-release-2-tenant namespace
+#
+#   This is the ONLY way to trigger the test automatically - it does NOT run on:
+#     - /test or /retest comments
+#     - Push events
+#     - PR creation/update
+#
+#   The PR trigger ensures controlled execution of this resource-intensive test.
+#   See .tekton/rh-advisories-large-snapshot.yaml for pipeline configuration.
 #
 # ============================================================================
 
@@ -127,9 +151,13 @@ COMPONENT_COUNT="${1:-200}"  # Target total components (default: 200)
 NAMESPACE="${2:-dev-release-team-tenant}"
 OUTPUT_FILE="${3:-/tmp/images-pool-$(date +%s).txt}"
 FORCE_REBUILD="${4:-false}"  # Force fresh builds, disable image reuse (default: false)
+SKIP_BUILD="${5:-false}"     # Repair-only mode: fix existing, don't build new (default: false)
 
 # Set DISABLE_QUAY_REUSE based on FORCE_REBUILD parameter
-if [ "${FORCE_REBUILD}" = "true" ]; then
+# SKIP_BUILD mode always enables Quay reuse (repair mode)
+if [ "${SKIP_BUILD}" = "true" ]; then
+    export DISABLE_QUAY_REUSE="false"
+elif [ "${FORCE_REBUILD}" = "true" ]; then
     export DISABLE_QUAY_REUSE="true"
 else
     export DISABLE_QUAY_REUSE="${DISABLE_QUAY_REUSE:-false}"
@@ -137,7 +165,7 @@ fi
 
 # Multi-version simulation settings - realistic production scenario
 # Multiple product versions each with multiple components
-PRODUCT_VERSIONS="${PRODUCT_VERSIONS:-10}"             # Number of product versions
+PRODUCT_VERSIONS="${PRODUCT_VERSIONS:-8}"              # Number of product versions (4.15-4.22)
 COMPONENTS_PER_VERSION="${COMPONENTS_PER_VERSION:-25}"  # Components per version (~25 each)
 VERSION_VARIANCE="${VERSION_VARIANCE:-3}"      # +/- variance in component count per version
 
@@ -150,7 +178,10 @@ APP_PREFIX="large-snapshot-build"
 BASE_REPO="${BASE_REPO:-hacbs-release-tests/e2e-base}"
 # Use a branch with proper PAC configuration as template
 # This branch has .tekton/ directory with EC-compliant pipeline
-PAC_TEMPLATE_BRANCH="${PAC_TEMPLATE_BRANCH:-konflux-v4-15-apiserver-watcher-01}"
+# Using existing konflux-ls- branch from previous runs as template
+# Note: konflux-ls-v4-15-apiserver-watcher-01 doesn't exist (only -27 for v4-15)
+# Using v4-16 version as template
+PAC_TEMPLATE_BRANCH="${PAC_TEMPLATE_BRANCH:-konflux-ls-v4-16-apiserver-watcher-01}"
 BASE_BRANCH="${BASE_BRANCH:-push-to-external-registry-base}"
 BASE_GITHUB_URL="https://github.com/${BASE_REPO}"
 
@@ -175,22 +206,22 @@ VERSION_PATTERNS=(
     "4.20"
     "4.21"
     "4.22"
-    "4.23"
-    "4.24"
+    # Note: v4-23 and v4-24 were never built
+    # Uncomment below when images exist for these versions:
+    # "4.23"
+    # "4.24"
 )
 
-# Quay.io API authentication (optional - enables private repo access)
-QUAY_TOKEN=""
-QUAY_SECRET_NAME="${QUAY_SECRET_NAME:-test-quay-token-secret}"
-if kubectl get secret "${QUAY_SECRET_NAME}" -n "${NAMESPACE}" &>/dev/null; then
-    QUAY_AUTH=$(kubectl get secret "${QUAY_SECRET_NAME}" -n "${NAMESPACE}" \
-        -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null | base64 -d | \
-        jq -r '.auths["quay.io"].auth // empty' 2>/dev/null | base64 -d 2>/dev/null)
-    
-    if [ -n "${QUAY_AUTH}" ]; then
-        QUAY_TOKEN="${QUAY_AUTH#*:}"
-        echo "ℹ️  ✓ Quay.io API authentication enabled (using ${QUAY_SECRET_NAME})" >&2
-    fi
+# Quay.io access methods:
+# 1. skopeo (preferred) - uses Docker registry auth from pod's ImagePullSecrets
+# 2. Quay REST API (fallback) - requires QUAY_TOKEN OAuth token
+# Note: Most pods already have ImagePullSecrets configured, so skopeo works out-of-the-box
+if command -v skopeo &>/dev/null; then
+    echo "ℹ️  ✓ Quay.io access via skopeo (using Docker registry credentials)" >&2
+elif [ -n "${QUAY_TOKEN:-}" ]; then
+    echo "ℹ️  ✓ Quay.io access via REST API (using QUAY_TOKEN)" >&2
+else
+    echo "⚠️  No skopeo available and QUAY_TOKEN not set - image discovery may fail" >&2
 fi
 
 # ============================================================================
@@ -271,69 +302,181 @@ component_has_successful_build() {
     return 1
 }
 
-# Check if image exists on Quay.io and return the digest
+# Check if image exists on Quay.io and return the digest (with retry logic)
+# Uses skopeo (preferred, works with Docker registry auth) or Quay REST API as fallback
 # Returns:
 #   0 - Image found (QUAY_IMAGE_DIGEST set)
-#   1 - No image (repo exists but no valid tags)
-#   2 - Cannot determine (403/404/network error - might be private repo or wrong registry)
+#   1 - No image found
+#   2 - Cannot determine (network error, auth failure)
 check_quay_image_exists() {
     local component_name="$1"
     local namespace="$2"
+    local image_base="quay.io/redhat-user-workloads-stage/${namespace}/${component_name}"
+    
+    local max_retries=2
+    local retry_count=0
+    
+    # Method 1: Try skopeo (preferred - uses Docker registry auth from pod's ImagePullSecrets)
+    if command -v skopeo &>/dev/null; then
+        # Retry loop for transient failures
+        while [ $retry_count -le $max_retries ]; do
+            # Try to list tags using skopeo (capture both stdout and stderr for diagnostics)
+            local list_output
+            local error_output
+            local error_file=$(mktemp)
+            
+            set +e  # Disable errexit for skopeo commands
+            list_output=$(skopeo list-tags "docker://${image_base}" 2>"${error_file}")
+            local skopeo_exit=$?
+            error_output=$(cat "${error_file}" 2>/dev/null)
+            rm -f "${error_file}"
+            set -e  # Re-enable errexit
+            
+            # Success case - process the result
+            if [ $skopeo_exit -eq 0 ] && [ -n "$list_output" ]; then
+                # Get first non-attestation tag
+                local first_tag
+                first_tag=$(echo "$list_output" | jq -r '
+                    [.Tags[] 
+                    | select(. != null and . != "")
+                    | select((contains(".sig") or contains(".att") or contains(".sbom") or contains(".dockerfile")) | not)
+                    ][0] // ""' 2>/dev/null || echo "")
+                
+                if [ -n "$first_tag" ] && [ "$first_tag" != "null" ]; then
+                    # Get digest for this tag (with error capture and retry)
+                    local digest
+                    local inspect_error_file=$(mktemp)
+                    
+                    set +e
+                    digest=$(skopeo inspect --format '{{.Digest}}' "docker://${image_base}:${first_tag}" 2>"${inspect_error_file}")
+                    local inspect_exit=$?
+                    local inspect_error=$(cat "${inspect_error_file}" 2>/dev/null)
+                    rm -f "${inspect_error_file}"
+                    set -e
+                    
+                    if [ $inspect_exit -eq 0 ] && [ -n "$digest" ] && [ "$digest" != "null" ]; then
+                        QUAY_IMAGE_DIGEST="${image_base}@${digest}"
+                        return 0
+                    fi
+                    
+                    # Inspect failed - check if it's retryable
+                    if [ $retry_count -lt $max_retries ]; then
+                        if echo "${inspect_error}" | grep -qi "too many requests\|rate limit\|429"; then
+                            log_warning "   ⏱️  Rate limit on inspect for ${component_name}, retry $((retry_count + 1))/${max_retries} in 5 min..."
+                            sleep 300  # 5 minutes
+                        else
+                            log_warning "   ⚠️  Inspect failed for ${component_name}, retry $((retry_count + 1))/${max_retries} in 1 min: ${inspect_error:0:80}"
+                            sleep 60  # 1 minute
+                        fi
+                        retry_count=$((retry_count + 1))
+                        continue
+                    else
+                        log_warning "   ⚠️  Failed to get digest for ${component_name}:${first_tag} after ${max_retries} retries"
+                        return 1
+                    fi
+                fi
+                
+                # List succeeded but no valid tags found - image doesn't exist (no retry needed)
+                return 1
+            fi
+            
+            # Failure case - diagnose and decide if retry is needed
+            if [ $skopeo_exit -ne 0 ]; then
+                # Check for specific error patterns
+                if echo "${error_output}" | grep -qi "not found\|404"; then
+                    # Repository doesn't exist - this is permanent, don't retry
+                    return 1  # No image
+                elif echo "${error_output}" | grep -qi "too many requests\|rate limit\|429"; then
+                    if [ $retry_count -lt $max_retries ]; then
+                        log_warning "   ⏱️  Rate limit hit for ${component_name}, retry $((retry_count + 1))/${max_retries} in 5 min..."
+                        rate_limit_count=$((rate_limit_count + 1))
+                        sleep 300  # 5 minutes for rate limits
+                        retry_count=$((retry_count + 1))
+                        continue
+                    else
+                        log_error "   ❌ Rate limit persists for ${component_name} after ${max_retries} retries"
+                        return 2  # Rate limit
+                    fi
+                elif echo "${error_output}" | grep -qi "unauthorized\|authentication required\|401\|403\|manifest unknown"; then
+                    if [ $retry_count -lt $max_retries ]; then
+                        log_warning "   🔒 Auth issue for ${component_name}, retry $((retry_count + 1))/${max_retries} in 1 min: ${error_output:0:80}"
+                        auth_error_count=$((auth_error_count + 1))
+                        sleep 60  # 1 minute for auth issues
+                        retry_count=$((retry_count + 1))
+                        continue
+                    else
+                        log_error "   ❌ Auth issue persists for ${component_name} after ${max_retries} retries"
+                        return 2  # Auth failure
+                    fi
+                elif echo "${error_output}" | grep -qi "timeout\|connection refused\|network"; then
+                    if [ $retry_count -lt $max_retries ]; then
+                        log_warning "   🌐 Network issue for ${component_name}, retry $((retry_count + 1))/${max_retries} in 1 min..."
+                        network_error_count=$((network_error_count + 1))
+                        sleep 60  # 1 minute for network issues
+                        retry_count=$((retry_count + 1))
+                        continue
+                    else
+                        log_error "   ❌ Network issue persists for ${component_name} after ${max_retries} retries"
+                        return 2  # Network error
+                    fi
+                else
+                    # Unknown error - treat as transient and retry
+                    if [ $retry_count -lt $max_retries ]; then
+                        log_warning "   ⚠️  Skopeo error for ${component_name}, retry $((retry_count + 1))/${max_retries} in 1 min: exit=${skopeo_exit}, stderr=${error_output:0:100}"
+                        sleep 60  # 1 minute for unknown errors
+                        retry_count=$((retry_count + 1))
+                        continue
+                    else
+                        log_error "   ❌ Skopeo error persists for ${component_name} after ${max_retries} retries"
+                        return 1  # Treat as "not found"
+                    fi
+                fi
+            fi
+            
+            # Should not reach here, but safety break
+            break
+        done
+        
+        # If we exhausted retries, return failure
+        return 1
+    fi
+    
+    # Method 2: Fallback to Quay REST API (requires OAuth token)
     local repo_url="https://quay.io/api/v1/repository/redhat-user-workloads-stage/${namespace}/${component_name}"
     
     # Build curl command with optional authentication
     local curl_auth_args=()
-    if [ -n "${QUAY_TOKEN}" ]; then
+    if [ -n "${QUAY_TOKEN:-}" ]; then
         curl_auth_args=(-H "Authorization: Bearer ${QUAY_TOKEN}")
     fi
     
-    # Query Quay.io API (with authentication if available)
+    # Query Quay.io API
     local response
     response=$(curl -s -w "\n%{http_code}" "${curl_auth_args[@]}" "${repo_url}" 2>/dev/null || echo "000")
     local http_code=$(echo "$response" | tail -1)
-    local body=$(echo "$response" | head -n -1)
     
-    # Debug: Show what we got
-    if [ "${QUAY_CHECK_DEBUG:-false}" = "true" ]; then
-        log_info "      [DEBUG] Quay check: ${component_name}"
-        log_info "      [DEBUG] URL: ${repo_url}"
-        log_info "      [DEBUG] HTTP: ${http_code}"
-        log_info "      [DEBUG] Auth: ${QUAY_TOKEN:+enabled}"
-    fi
-    
-    # Check for access errors (might be private repo without auth, or wrong registry)
+    # Check for access errors
     if [ "$http_code" = "403" ] || [ "$http_code" = "404" ] || [ "$http_code" = "000" ]; then
-        if [ "${QUAY_CHECK_DEBUG:-false}" = "true" ]; then
-            log_info "      [DEBUG] Access error or not found - cannot determine if image exists"
-        fi
-        return 2  # Cannot determine (access denied, not found, or network error)
+        return 2  # Cannot determine
     fi
     
     if [ "$http_code" = "200" ]; then
-        # Repository exists - get tags, excluding attestation artifacts
+        # Repository exists - get tags
         local tags_url="${repo_url}/tag/?onlyActiveTags=true&limit=10"
         local tags_response
         tags_response=$(curl -s "${curl_auth_args[@]}" "${tags_url}" 2>/dev/null)
         
-        # Find first tag that's NOT .sig, .att, .sbom, .dockerfile (get real image tag)
+        # Find first non-attestation tag
         local manifest_digest
         manifest_digest=$(echo "$tags_response" | jq -r '
-            [
-                .tags[]
-                | select(.name | (contains(".sig") or contains(".att") or contains(".sbom") or contains(".dockerfile")) | not)
-                | .manifest_digest
-                | select(. != null and . != "")
+            [.tags[] 
+            | select(.name | (contains(".sig") or contains(".att") or contains(".sbom") or contains(".dockerfile")) | not)
+            | .manifest_digest
+            | select(. != null and . != "")
             ][0] // ""' 2>/dev/null)
         
-        if [ "${QUAY_CHECK_DEBUG:-false}" = "true" ]; then
-            log_info "      [DEBUG] Manifest digest: ${manifest_digest:-EMPTY}"
-            if [ -z "$manifest_digest" ]; then
-                log_info "      [DEBUG] Available tags: $(echo "$tags_response" | jq -r '.tags[].name' 2>/dev/null | head -5 | tr '\n' ', ')"
-            fi
-        fi
-        
-        if [ -n "$manifest_digest" ] && [ "$manifest_digest" != "null" ] && [ "$manifest_digest" != "empty" ]; then
-            QUAY_IMAGE_DIGEST="quay.io/redhat-user-workloads-stage/${namespace}/${component_name}@${manifest_digest}"
+        if [ -n "$manifest_digest" ] && [ "$manifest_digest" != "null" ]; then
+            QUAY_IMAGE_DIGEST="${image_base}@${manifest_digest}"
             return 0
         fi
     fi
@@ -381,6 +524,53 @@ force_delete_component() {
         log_warning "      ⚠️  Component still exists after forced deletion attempt"
         return 1
     fi
+    return 0
+}
+
+# Repair PAC status for a component (fix missing or invalid PAC configuration)
+# Usage: repair_pac_status <component_name> <namespace>
+# Returns: 0 if PAC is enabled or fix attempted, 1 if component doesn't exist
+repair_pac_status() {
+    local component_name="$1"
+    local namespace="$2"
+    
+    # Check if component exists
+    if ! kubectl get component "${component_name}" -n "${namespace}" &>/dev/null 2>&1; then
+        return 1
+    fi
+    
+    # Get current PAC status
+    local pac_status=$(kubectl get component "${component_name}" -n "${namespace}" \
+        -o jsonpath='{.metadata.annotations.build\.appstudio\.openshift\.io/status}' 2>/dev/null || echo "")
+    
+    if [ -z "${pac_status}" ]; then
+        # No PAC status annotation - trigger PAC configuration
+        log_info "      🔧 Fixing PAC: Triggering configuration for ${component_name}"
+        kubectl annotate component "${component_name}" -n "${namespace}" \
+            build.appstudio.openshift.io/request=configure-pac --overwrite &>/dev/null || return 1
+        return 0
+    fi
+    
+    # Check if PAC is enabled
+    local pac_state=$(echo "${pac_status}" | jq -r '.pac.state // "unknown"' 2>/dev/null || echo "unknown")
+    
+    if [ "${pac_state}" != "enabled" ]; then
+        # PAC exists but not enabled or in error state - re-trigger configuration
+        # Common error states: "error" (missing resources), "unknown", etc.
+        local error_msg=$(echo "${pac_status}" | jq -r '.pac."error-message" // "none"' 2>/dev/null || echo "none")
+        log_info "      🔧 Fixing PAC: Re-triggering configuration (state: ${pac_state}, error: ${error_msg})"
+        
+        # Clear the error status annotation first (allows fresh PAC processing)
+        kubectl annotate component "${component_name}" -n "${namespace}" \
+            build.appstudio.openshift.io/status- &>/dev/null || true
+        
+        # Trigger PAC configuration
+        kubectl annotate component "${component_name}" -n "${namespace}" \
+            build.appstudio.openshift.io/request=configure-pac --overwrite &>/dev/null || return 1
+        return 0
+    fi
+    
+    # PAC is already enabled
     return 0
 }
 
@@ -601,31 +791,73 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
     exit 1
 fi
 
-# Verify GITHUB_TOKEN has access to BASE_REPO
+# Verify GITHUB_TOKEN has access to BASE_REPO (with retry for rate limits)
 log_info "Verifying GITHUB_TOKEN has access to ${BASE_REPO}..."
 
-# Capture full API response for debugging
-REPO_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: token ${GITHUB_TOKEN}" \
-    "https://api.github.com/repos/${BASE_REPO}" 2>&1)
+MAX_GITHUB_RETRIES=2
+github_retry=0
+github_success=false
 
-# Extract HTTP status code
-HTTP_CODE=$(echo "${REPO_RESPONSE}" | grep "HTTP_CODE:" | cut -d: -f2)
-REPO_JSON=$(echo "${REPO_RESPONSE}" | sed '/HTTP_CODE:/d')
+while [ $github_retry -le $MAX_GITHUB_RETRIES ]; do
+    # Capture full API response for debugging
+    REPO_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -H "Authorization: token ${GITHUB_TOKEN}" \
+        "https://api.github.com/repos/${BASE_REPO}" 2>&1)
 
-# Extract full_name or error message using jq (preferred)
-if command -v jq &>/dev/null; then
-    REPO_CHECK=$(echo "${REPO_JSON}" | jq -r '.full_name // empty' 2>/dev/null)
-    REPO_ERROR=$(echo "${REPO_JSON}" | jq -r '.message // empty' 2>/dev/null)
-else
-    # Fallback: grep for full_name without jq
-    REPO_CHECK=$(echo "${REPO_JSON}" | grep -o '"full_name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-    REPO_ERROR=$(echo "${REPO_JSON}" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-fi
+    # Extract HTTP status code
+    HTTP_CODE=$(echo "${REPO_RESPONSE}" | grep "HTTP_CODE:" | cut -d: -f2)
+    REPO_JSON=$(echo "${REPO_RESPONSE}" | sed '/HTTP_CODE:/d')
 
-# Check if access was successful
-if [ "$HTTP_CODE" = "200" ] && [ -n "$REPO_CHECK" ]; then
-    log_info "  ✓ Token has access to ${BASE_REPO}"
-elif [ -z "$REPO_CHECK" ]; then
+    # Extract full_name or error message using jq (preferred)
+    if command -v jq &>/dev/null; then
+        REPO_CHECK=$(echo "${REPO_JSON}" | jq -r '.full_name // empty' 2>/dev/null)
+        REPO_ERROR=$(echo "${REPO_JSON}" | jq -r '.message // empty' 2>/dev/null)
+    else
+        # Fallback: grep for full_name without jq
+        REPO_CHECK=$(echo "${REPO_JSON}" | grep -o '"full_name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+        REPO_ERROR=$(echo "${REPO_JSON}" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+    fi
+
+    # Check if access was successful
+    if [ "$HTTP_CODE" = "200" ] && [ -n "$REPO_CHECK" ]; then
+        log_info "  ✓ Token has access to ${BASE_REPO}"
+        github_success=true
+        break
+    elif [ "$HTTP_CODE" = "403" ] && echo "${REPO_ERROR}" | grep -qi "rate limit"; then
+        # GitHub API rate limit hit
+        if [ $github_retry -lt $MAX_GITHUB_RETRIES ]; then
+            # Get rate limit reset time if available
+            RATE_LIMIT_INFO=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                "https://api.github.com/rate_limit" 2>/dev/null)
+            RESET_TIME=$(echo "${RATE_LIMIT_INFO}" | jq -r '.resources.core.reset // empty' 2>/dev/null)
+            
+            if [ -n "$RESET_TIME" ]; then
+                CURRENT_TIME=$(date +%s)
+                WAIT_SECONDS=$((RESET_TIME - CURRENT_TIME + 60))  # Add 1 min buffer
+                if [ $WAIT_SECONDS -lt 60 ]; then
+                    WAIT_SECONDS=60  # Minimum 1 minute
+                fi
+                log_warning "⏱️  GitHub API rate limit hit, waiting ${WAIT_SECONDS}s until reset (retry $((github_retry + 1))/${MAX_GITHUB_RETRIES})..."
+                sleep $WAIT_SECONDS
+            else
+                # Can't determine reset time, use default 5 min
+                log_warning "⏱️  GitHub API rate limit hit, retry $((github_retry + 1))/${MAX_GITHUB_RETRIES} in 5 min..."
+                sleep 300
+            fi
+            github_retry=$((github_retry + 1))
+            continue
+        else
+            log_error "❌ GitHub API rate limit persists after ${MAX_GITHUB_RETRIES} retries"
+            log_error "Rate limit error: ${REPO_ERROR}"
+            exit 1
+        fi
+    else
+        # Other error - not retryable
+        break
+    fi
+done
+
+# Check final result
+if [ "$github_success" = "false" ]; then
     log_error "GITHUB_TOKEN cannot access repository ${BASE_REPO}"
     log_error "HTTP Status: ${HTTP_CODE:-unknown}"
     if [ -n "$REPO_ERROR" ]; then
@@ -643,8 +875,6 @@ elif [ -z "$REPO_CHECK" ]; then
     log_error "Debug: Raw API response (first 300 chars):"
     log_error "$(echo "${REPO_JSON}" | head -c 300)"
     exit 1
-else
-    log_info "  ✓ Token has access to ${BASE_REPO}"
 fi
 
 # Check namespace exists (this also validates cluster connectivity)
@@ -674,23 +904,62 @@ EXISTING_COMPONENT_COUNT=$(echo "${ALL_COMPONENTS_JSON}" | jq '.items | length')
 # OPTIMIZATION: Fetch all GitHub branches once (paginated, max 3 pages = 300 branches)
 log_info "Fetching existing GitHub branches (batch query to reduce API calls)..."
 ALL_GITHUB_BRANCHES=""
-for page in 1 2 3; do
-    page_branches=$(curl -s \
-        -H "Authorization: token ${GITHUB_TOKEN}" \
-        "https://api.github.com/repos/${BASE_REPO}/branches?per_page=100&page=${page}" 2>/dev/null | \
-        jq -r '.[].name' 2>/dev/null || echo "")
+branches_retry=0
+branches_success=false
+
+while [ $branches_retry -le $MAX_GITHUB_RETRIES ]; do
+    ALL_GITHUB_BRANCHES=""
+    rate_limit_hit=false
     
-    if [ -z "$page_branches" ]; then
-        break  # No more branches
-    fi
-    ALL_GITHUB_BRANCHES="${ALL_GITHUB_BRANCHES}${page_branches}"$'\n'
+    for page in 1 2 3; do
+        page_response=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${BASE_REPO}/branches?per_page=100&page=${page}" 2>/dev/null)
+        
+        page_http_code=$(echo "$page_response" | grep "HTTP_CODE:" | cut -d: -f2)
+        page_json=$(echo "$page_response" | sed '/HTTP_CODE:/d')
+        
+        # Check for rate limit
+        if [ "$page_http_code" = "403" ] && echo "$page_json" | grep -qi "rate limit"; then
+            rate_limit_hit=true
+            break
+        fi
+        
+        page_branches=$(echo "$page_json" | jq -r '.[].name' 2>/dev/null || echo "")
+        
+        if [ -z "$page_branches" ]; then
+            break  # No more branches
+        fi
+        ALL_GITHUB_BRANCHES="${ALL_GITHUB_BRANCHES}${page_branches}"$'\n'
+        
+        # If we got less than 100, no more pages
+        branch_count=$(echo "$page_branches" | wc -l)
+        if [ $branch_count -lt 100 ]; then
+            break
+        fi
+    done
     
-    # If we got less than 100, no more pages
-    branch_count=$(echo "$page_branches" | wc -l)
-    if [ $branch_count -lt 100 ]; then
+    if [ "$rate_limit_hit" = "true" ]; then
+        if [ $branches_retry -lt $MAX_GITHUB_RETRIES ]; then
+            log_warning "⏱️  GitHub API rate limit while fetching branches, retry $((branches_retry + 1))/${MAX_GITHUB_RETRIES} in 5 min..."
+            sleep 300
+            branches_retry=$((branches_retry + 1))
+            continue
+        else
+            log_error "❌ GitHub API rate limit persists while fetching branches after ${MAX_GITHUB_RETRIES} retries"
+            exit 1
+        fi
+    else
+        branches_success=true
         break
     fi
 done
+
+if [ "$branches_success" = "false" ]; then
+    log_error "❌ Failed to fetch GitHub branches after retries"
+    exit 1
+fi
+
 log_info "  Found $(echo "$ALL_GITHUB_BRANCHES" | grep -c "^konflux-ls-") rh-advisories-large-snapshot test branches"
 
 # Count components with successful builds (reusable images) - using in-memory data
@@ -789,6 +1058,9 @@ log_info "   Product versions: ${PRODUCT_VERSIONS}"
 log_info "   Components/version: ~${COMPONENTS_PER_VERSION} (±${VERSION_VARIANCE})"
 if [ "${FORCE_REBUILD}" = "true" ]; then
     log_info "   🔄 Force rebuild: ENABLED (no Quay image reuse)"
+fi
+if [ "${SKIP_BUILD}" = "true" ]; then
+    log_info "   🔧 Repair mode: ENABLED (fix existing, no new builds)"
 fi
 echo "" >&2
 log_info "🎯 Multi-Version Strategy:"
@@ -924,6 +1196,9 @@ total_components=0
 skipped_count=0
 quay_reused_count=0
 cannot_verify_count=0  # Zombies we couldn't verify (possible private repo)
+rate_limit_count=0     # Components skipped due to rate limiting
+auth_error_count=0     # Components skipped due to auth errors
+network_error_count=0  # Components skipped due to network errors
 actual_new_count=0  # Track ACTUAL new components created (not reused)
 
 # Iterate through each application (product version)
@@ -937,6 +1212,8 @@ while IFS=: read -r app_name component_count; do
     
     # Create components for this version (in batches)
     for (( i=1; i<=component_count; i++ )); do
+        # Debug: Log entry into loop iteration (helps identify failures in first iteration)
+        [ "$i" -eq 1 ] && log_info "   🔍 Starting component processing loop (i=1, component_count=${component_count})" || true
         # Check if we've reached limits
         # Priority 1: Stop if we've reached the target total (200 VALID components)
         # Priority 2: Stop if we've triggered max new builds (50 builds to avoid resource exhaustion)
@@ -1000,7 +1277,10 @@ while IFS=: read -r app_name component_count; do
                 log_warning "   🔧 Component ${component_name} exists but missing secret field, deleting for recreation..."
                 
                 # Delete existing component (will be recreated below with proper secret)
-                force_delete_component "${component_name}" "${NAMESPACE}"
+                if ! force_delete_component "${component_name}" "${NAMESPACE}"; then
+                    log_error "   ❌ Failed to delete component ${component_name} (missing secret), skipping..."
+                    continue
+                fi
                 
                 # Don't continue with component existence checks - treat as if component doesn't exist
                 # This allows fall-through to component creation logic below
@@ -1044,8 +1324,13 @@ while IFS=: read -r app_name component_count; do
             if [ "${DISABLE_QUAY_REUSE:-false}" = "true" ]; then
                 quay_check_result=1  # Force "not found"
             else
+                # Temporarily disable errexit and ERR trap to handle function return codes gracefully
+                set +e
+                trap - ERR
                 check_quay_image_exists "${component_name}" "${NAMESPACE}"
                 quay_check_result=$?
+                trap 'echo "❌ ERROR at line $LINENO: Command failed with exit code $?" >&2' ERR
+                set -e
             fi
             
             if [ "$quay_check_result" -eq 0 ]; then
@@ -1053,7 +1338,10 @@ while IFS=: read -r app_name component_count; do
                 log_info "   🔄 Recreating zombie component with Quay image: ${component_name}"
                 
                 # Delete existing component (cleaner than patching)
-                force_delete_component "${component_name}" "${NAMESPACE}"
+                if ! force_delete_component "${component_name}" "${NAMESPACE}"; then
+                    log_error "   ❌ Failed to delete zombie component ${component_name}, skipping..."
+                    continue
+                fi
                 
                 # Create GitHub branch for consistency (required for PipelineRuns)
                 if ! create_github_branch_for_component "${component_name}"; then
@@ -1062,7 +1350,7 @@ while IFS=: read -r app_name component_count; do
                 fi
                 
                 # Create fresh component with correct image
-                kubectl create -f - <<EOF
+                if ! kubectl create -f - <<EOF
 apiVersion: appstudio.redhat.com/v1alpha1
 kind: Component
 metadata:
@@ -1075,6 +1363,9 @@ metadata:
   annotations:
     test.appstudio.openshift.io/discovered-from-quay: "true"
     test.appstudio.openshift.io/reused-image: "true"
+    # Multi-architecture build configuration (for future rebuilds)
+    build.appstudio.openshift.io/multi-platform-required: "true"
+    build.appstudio.openshift.io/request-platforms: "linux/amd64,linux/arm64,linux/s390x,linux/ppc64le"
 spec:
   application: ${app_name}
   componentName: ${component_name}
@@ -1085,6 +1376,10 @@ spec:
       url: https://github.com/${BASE_REPO}
       revision: konflux-ls-${component_name}
 EOF
+                then
+                    log_error "   ❌ Failed to create salvaged component ${component_name}, skipping..."
+                    continue
+                fi
                 
                 # Wait for PAC to create the service account (even though we're reusing image, PAC may trigger builds)
                 service_account_name="build-pipeline-${component_name}"
@@ -1125,7 +1420,10 @@ EOF
             else
                 # No image on Quay (got 200 but no tags) - delete the zombie component
                 log_warning "   🗑️  Deleting zombie component (no image anywhere): ${component_name}"
-                force_delete_component "${component_name}" "${NAMESPACE}"
+                if ! force_delete_component "${component_name}" "${NAMESPACE}"; then
+                    log_error "   ❌ Failed to delete zombie component ${component_name}, skipping..."
+                    continue
+                fi
                 # Don't check Quay again - we just checked and it wasn't there
                 # Fall through to build trigger (skip the redundant Quay check below)
             fi
@@ -1137,14 +1435,22 @@ EOF
         # DISABLE_QUAY_REUSE: Skip Quay check for fresh builds (for /build-large-snapshot)
         if [ "${quay_already_checked}" = "false" ] && [ "${DISABLE_QUAY_REUSE:-false}" != "true" ]; then
             QUAY_IMAGE_DIGEST=""
-            if check_quay_image_exists "${component_name}" "${NAMESPACE}"; then
+            # Temporarily disable errexit and ERR trap to handle function return codes gracefully
+            set +e
+            trap - ERR
+            check_quay_image_exists "${component_name}" "${NAMESPACE}"
+            quay_check_result=$?
+            trap 'echo "❌ ERROR at line $LINENO: Command failed with exit code $?" >&2' ERR
+            set -e
+            
+            if [ "$quay_check_result" -eq 0 ]; then
                 # Image exists! Create component pointing to it (no build needed)
                 log_info "   ✨ Found existing image on Quay: ${component_name}"
                 
                 # Step 1: Create component first (without branch - avoids race condition)
                 echo "${component_name}:${app_name}" >> "${COMPONENT_LIST}"
                 
-                kubectl create -f - <<EOF
+                if ! kubectl create -f - <<EOF
 apiVersion: appstudio.redhat.com/v1alpha1
 kind: Component
 metadata:
@@ -1157,6 +1463,9 @@ metadata:
   annotations:
     test.appstudio.openshift.io/discovered-from-quay: "true"
     test.appstudio.openshift.io/reused-image: "true"
+    # Multi-architecture build configuration (for future rebuilds)
+    build.appstudio.openshift.io/multi-platform-required: "true"
+    build.appstudio.openshift.io/request-platforms: "linux/amd64,linux/arm64,linux/s390x,linux/ppc64le"
 spec:
   application: ${app_name}
   componentName: ${component_name}
@@ -1167,6 +1476,10 @@ spec:
       url: https://github.com/${BASE_REPO}
       revision: konflux-ls-${component_name}
 EOF
+                then
+                    log_error "   ❌ Failed to create component ${component_name} for Quay-discovered image, skipping..."
+                    continue
+                fi
                 
                 # Wait for PAC to create the service account
                 service_account_name="build-pipeline-${component_name}"
@@ -1192,7 +1505,25 @@ EOF
                 # Don't increment created_count - semantically this is "reuse" not "create"
                 # Don't increment actual_new_count - no new BUILD happened (image already existed)
                 continue
+            elif [ "$quay_check_result" -eq 2 ]; then
+                # Cannot access Quay (network error)
+                log_warning "   ⚠️  Cannot access Quay for ${component_name} (network error)"
+                
+                if [ "${SKIP_BUILD}" = "true" ]; then
+                    log_warning "      Skipping - cannot verify if image exists (SKIP_BUILD mode)"
+                    continue
+                fi
+                
+                # In build mode, proceed with fresh build
+                log_warning "      Proceeding with fresh build (cannot verify if image exists)"
             fi
+        fi
+        
+        # Image doesn't exist - check if we should create/build or skip
+        # SKIP_BUILD mode: Don't create new components that need building
+        if [ "${SKIP_BUILD}" = "true" ]; then
+            log_info "   ⏭️  Skipping ${component_name}: No existing image (SKIP_BUILD mode)"
+            continue
         fi
         
         # Image doesn't exist - create component FIRST, then branch, then trigger PAC
@@ -1203,7 +1534,7 @@ EOF
         
         BUILD_ANNOTATION="build.appstudio.openshift.io/request: \"configure-pac\""
         
-        kubectl create -f - <<EOF
+        if ! kubectl create -f - <<EOF
 apiVersion: appstudio.redhat.com/v1alpha1
 kind: Component
 metadata:
@@ -1236,6 +1567,10 @@ spec:
       revision: konflux-ls-${component_name}
       url: ${BASE_GITHUB_URL}
 EOF
+        then
+            log_error "   ❌ Failed to create component ${component_name}, skipping..."
+            continue
+        fi
         
         created_count=$((created_count + 1))
         total_components=$((total_components + 1))
@@ -1266,7 +1601,29 @@ EOF
         else
             log_info "   ✓ GitHub branch ready"
             
-            # Step 3: Trigger PAC build now that both component and branch exist
+            # Step 3: Wait for PAC to finish processing (check for "enabled" status)
+            log_info "   ⏳ Waiting for PAC to enable..."
+            pac_wait_time=0
+            pac_max_wait=60
+            pac_enabled=false
+            while [ $pac_wait_time -lt $pac_max_wait ]; do
+                pac_status=$(kubectl get component "${component_name}" -n "${NAMESPACE}" \
+                    -o jsonpath='{.metadata.annotations.build\.appstudio\.openshift\.io/status}' 2>/dev/null || echo "")
+                
+                if echo "${pac_status}" | grep -q '"state":"enabled"'; then
+                    pac_enabled=true
+                    log_info "   ✓ PAC enabled (${pac_wait_time}s)"
+                    break
+                fi
+                sleep 2
+                pac_wait_time=$((pac_wait_time + 2))
+            done
+            
+            if [ "${pac_enabled}" = "false" ]; then
+                log_warning "   ⚠️  PAC not enabled after ${pac_max_wait}s, trying trigger anyway..."
+            fi
+            
+            # Step 4: Trigger PAC build now that PAC is enabled
             # Update annotation to trigger-pac-build to start the build
             kubectl annotate component "${component_name}" -n "${NAMESPACE}" \
                 "build.appstudio.openshift.io/request=trigger-pac-build" --overwrite
@@ -1326,16 +1683,154 @@ fi
 ACTUAL_CREATED_COUNT=${total_components}
 
 # ============================================================================
+# Step 2.5: Repair Existing Components (SKIP_BUILD mode)
+# ============================================================================
+
+if [ "${SKIP_BUILD}" = "true" ]; then
+    log_section "🔧 Step 2.5/6: Repairing Existing Components"
+    log_info "SKIP_BUILD mode: Attempting to repair invalid components without building..."
+    echo "" >&2
+    
+    REPAIR_DIGEST_COUNT=0
+    REPAIR_PAC_COUNT=0
+    REPAIR_SECRET_COUNT=0
+    
+    # Get all components for repair
+    ALL_REPAIR_COMPONENTS=$(kubectl get components -n "${NAMESPACE}" \
+        -l test.appstudio.openshift.io/type=multi-version-build \
+        -o json 2>/dev/null)
+    
+    log_info "Checking all components for repairs..."
+    echo "" >&2
+    
+    # Create temporary file for component names (avoid subshell issue)
+    REPAIR_TEMP="${TEMP_DIR}/repair-components.txt"
+    echo "${ALL_REPAIR_COMPONENTS}" | jq -r '.items[].metadata.name' > "${REPAIR_TEMP}"
+    
+    # Process each component
+    while read -r comp_name; do
+        [ -z "${comp_name}" ] && continue
+        
+        # Get component data
+        comp_data=$(echo "${ALL_REPAIR_COMPONENTS}" | jq -r --arg name "${comp_name}" \
+            '.items[] | select(.metadata.name == $name)')
+        
+        needs_repair=false
+        
+        # 1. Check and fix missing secret
+        has_secret=$(echo "${comp_data}" | jq -r '.spec.secret // ""')
+        if [ -z "${has_secret}" ]; then
+            log_info "   🔧 ${comp_name}: Adding missing secret field"
+            if kubectl patch component ${comp_name} -n ${NAMESPACE} \
+                --type=merge -p '{"spec":{"secret":"pipelines-as-code-secret"}}' &>/dev/null; then
+                REPAIR_SECRET_COUNT=$((REPAIR_SECRET_COUNT + 1))
+                needs_repair=true
+            fi
+        fi
+        
+        # 2. Check and fix missing digest in spec
+        spec_image=$(echo "${comp_data}" | jq -r '.spec.containerImage // ""')
+        status_image=$(echo "${comp_data}" | jq -r '.status.lastPromotedImage // ""')
+        
+        if [ -n "${status_image}" ] && [[ "${status_image}" == *"@sha256:"* ]]; then
+            if [[ "${spec_image}" != *"@sha256:"* ]]; then
+                log_info "   🔧 ${comp_name}: Copying digest from status to spec"
+                if kubectl patch component ${comp_name} -n ${NAMESPACE} \
+                    --type=merge -p "{\"spec\":{\"containerImage\":\"${status_image}\"}}" &>/dev/null; then
+                    REPAIR_DIGEST_COUNT=$((REPAIR_DIGEST_COUNT + 1))
+                    needs_repair=true
+                fi
+            fi
+        fi
+        
+        # 3. Check and fix PAC status
+        pac_status=$(echo "${comp_data}" | jq -r '.metadata.annotations."build.appstudio.openshift.io/status" // ""')
+        if [ -z "${pac_status}" ]; then
+            pac_state="missing"
+        else
+            pac_state=$(echo "${pac_status}" | jq -r '.pac.state // "unknown"' 2>/dev/null || echo "unknown")
+        fi
+        
+        if [ "${pac_state}" != "enabled" ]; then
+            # Handle error states (e.g., error-id: 75 - missing GitHub resources)
+            if [ "${pac_state}" == "error" ]; then
+                error_msg=$(echo "${pac_status}" | jq -r '.pac."error-message" // "unknown"' 2>/dev/null || echo "unknown")
+                log_info "   🔧 ${comp_name}: Fixing PAC error (${error_msg})"
+                # Clear error status first
+                kubectl annotate component ${comp_name} -n ${NAMESPACE} \
+                    build.appstudio.openshift.io/status- &>/dev/null || true
+            else
+                log_info "   🔧 ${comp_name}: Triggering PAC configuration (state: ${pac_state})"
+            fi
+            
+            if kubectl annotate component ${comp_name} -n ${NAMESPACE} \
+                build.appstudio.openshift.io/request=configure-pac --overwrite &>/dev/null; then
+                REPAIR_PAC_COUNT=$((REPAIR_PAC_COUNT + 1))
+                needs_repair=true
+            fi
+        fi
+        
+        [ "${needs_repair}" = "true" ] || log_info "   ✅ ${comp_name}: Already valid"
+    done < "${REPAIR_TEMP}"
+    
+    echo "" >&2
+    log_success "Repair complete:"
+    log_info "   Digests fixed: ${REPAIR_DIGEST_COUNT}"
+    log_info "   PAC triggered: ${REPAIR_PAC_COUNT}"
+    log_info "   Secrets added: ${REPAIR_SECRET_COUNT}"
+    echo "" >&2
+    
+    # Wait for PAC to process if we triggered it
+    if [ ${REPAIR_PAC_COUNT} -gt 0 ]; then
+        log_info "⏳ Waiting 90 seconds for PAC to process ${REPAIR_PAC_COUNT} components..."
+        sleep 90
+        echo "" >&2
+    fi
+    
+    # Validate if we have enough valid components
+    # Validation criteria: spec.containerImage contains @sha256 (has valid image)
+    # Note: PAC status is NOT checked - it's only needed for triggering NEW builds
+    #       Components with PAC errors can still be used if they have valid images
+    log_info "Validating component count after repairs..."
+    VALID_COUNT=$(kubectl get components -n "${NAMESPACE}" \
+        -l test.appstudio.openshift.io/type=multi-version-build \
+        -o json 2>/dev/null | \
+        jq '[.items[] | select(.spec.containerImage | contains("@sha256:"))] | length')
+    
+    log_info "   Valid components: ${VALID_COUNT}/${COMPONENT_COUNT}"
+    echo "" >&2
+    
+    if [ ${VALID_COUNT} -lt ${COMPONENT_COUNT} ]; then
+        log_error "❌ SKIP_BUILD mode: Only ${VALID_COUNT} valid components after repairs (target: ${COMPONENT_COUNT})"
+        log_error "   Missing: $((COMPONENT_COUNT - VALID_COUNT)) components"
+        log_error "   Run without SKIP_BUILD to build missing components"
+        exit 1
+    fi
+    
+    log_success "✅ Repair successful: ${VALID_COUNT} valid components available"
+    echo "" >&2
+    
+    # Skip build steps - go directly to digest patching and output
+    log_info "Skipping build steps (SKIP_BUILD mode), proceeding to output generation..."
+    echo "" >&2
+fi
+
+# ============================================================================
 # Step 3: Wait for Builds to Start (or Create Manual PipelineRuns)
 # ============================================================================
 
-# Skip build monitoring if no new components were created this run
-if [ ${created_count} -eq 0 ]; then
+# Skip build monitoring if SKIP_BUILD mode or no new components were created
+if [ "${SKIP_BUILD}" = "true" ] || [ ${created_count} -eq 0 ]; then
     log_section "♻️  Step 3/5: Skipping Build Wait (No New Builds)"
-    log_info "No new components created this run"
-    log_info "   Existing components: ${EXISTING_COMPONENT_COUNT} (${EXISTING_WITH_BUILDS} with builds, $((EXISTING_COMPONENT_COUNT - EXISTING_WITH_BUILDS)) zombies)"
-    log_info "   Reason: Already at target or build limit reached"
-    log_info "Proceeding to digest extraction for existing valid components..."
+    if [ "${SKIP_BUILD}" = "true" ]; then
+        log_info "SKIP_BUILD mode: No builds triggered (repair-only mode)"
+        log_info "Proceeding to digest extraction for existing valid components..."
+    else
+        log_info "No new components created this run"
+        log_info "   Existing components: ${EXISTING_COMPONENT_COUNT} (${EXISTING_WITH_BUILDS} with builds, $((EXISTING_COMPONENT_COUNT - EXISTING_WITH_BUILDS)) zombies)"
+        log_info "   Reason: Already at target or build limit reached"
+        log_info "Proceeding to digest extraction for existing valid components..."
+    fi
     echo "" >&2
 else
     log_section "⏳ Step 3/5: Waiting for PAC to Trigger Builds"
@@ -1598,7 +2093,9 @@ else
                 # No build at all - stuck in PAC configuration
                 log_info "   Deleting component (no build): ${component_name}"
                 echo "${component_name}:${app_name}" >> "${FAILED_COMPONENTS_FILE}"
-                force_delete_component "${component_name}" "${NAMESPACE}"
+                if ! force_delete_component "${component_name}" "${NAMESPACE}"; then
+                    log_warning "      ⚠️  Could not delete stuck component ${component_name}, continuing..."
+                fi
                 DELETED_STUCK=$((DELETED_STUCK + 1))
             else
                 plr_status=$(kubectl get pipelinerun "${plr_name}" -n "${NAMESPACE}" \
@@ -1608,7 +2105,9 @@ else
                     # Build failed
                     log_info "   Deleting component (build failed): ${component_name}"
                     echo "${component_name}:${app_name}" >> "${FAILED_COMPONENTS_FILE}"
-                    force_delete_component "${component_name}" "${NAMESPACE}"
+                    if ! force_delete_component "${component_name}" "${NAMESPACE}"; then
+                        log_warning "      ⚠️  Could not delete failed component ${component_name}, continuing..."
+                    fi
                     DELETED_FAILED=$((DELETED_FAILED + 1))
                 fi
             fi
@@ -1634,7 +2133,7 @@ else
                 
                 # Component creation with configure-pac (no build trigger yet)
                 # This avoids race condition where PAC fires before component exists
-                kubectl create -f - <<EOF
+                if ! kubectl create -f - <<EOF
 apiVersion: appstudio.redhat.com/v1alpha1
 kind: Component
 metadata:
@@ -1661,6 +2160,10 @@ spec:
       revision: konflux-ls-${component_name}
       url: ${BASE_GITHUB_URL}
 EOF
+                then
+                    log_warning "   ⚠️  Failed to recreate component ${component_name} on retry, skipping..."
+                    continue
+                fi
                 RETRY_COUNT=$((RETRY_COUNT + 1))
                 
                 # Wait for PAC to create the service account
@@ -1675,7 +2178,21 @@ EOF
                     wait_time=$((wait_time + 2))
                 done
                 
-                # Trigger PAC build now that component and service account exist
+                # Wait for PAC to finish processing (check for "enabled" status)
+                pac_wait_time=0
+                pac_max_wait=60
+                while [ $pac_wait_time -lt $pac_max_wait ]; do
+                    pac_status=$(kubectl get component "${component_name}" -n "${NAMESPACE}" \
+                        -o jsonpath='{.metadata.annotations.build\.appstudio\.openshift\.io/status}' 2>/dev/null || echo "")
+                    
+                    if echo "${pac_status}" | grep -q '"state":"enabled"'; then
+                        break
+                    fi
+                    sleep 2
+                    pac_wait_time=$((pac_wait_time + 2))
+                done
+                
+                # Trigger PAC build now that PAC is enabled
                 kubectl annotate component "${component_name}" -n "${NAMESPACE}" \
                     "build.appstudio.openshift.io/request=trigger-pac-build" --overwrite
                 
@@ -2005,19 +2522,25 @@ fi
 echo "" >&2
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Step 6: Patch Component Specs with Quay Digests
+# Step 6: Patch Component Specs with Build Digests
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Konflux doesn't auto-update component.spec.containerImage with build digests
 # This step ensures all components have the correct @sha256:... references
-# from Quay.io, which is the source of truth for built images
+# Strategy: Copy from status.lastPromotedImage (set by successful builds) to spec
 
-log_section "📋 Step 6/6: Patching Component Digests from Quay"
-log_info "Updating component specs with actual image digests from Quay.io registry..."
+log_section "📋 Step 6/6: Patching Component Digests from Build Status"
+log_info "Copying image digests from status.lastPromotedImage to spec.containerImage..."
 echo "" >&2
 
 PATCHED_COUNT=0
 ALREADY_CORRECT=0
 PATCH_FAILED=0
+SKIPPED_NO_IMAGE=0
+
+# Get all components in one batch query (more efficient than per-component queries)
+ALL_COMPONENT_DATA=$(kubectl get components -n "${NAMESPACE}" \
+    -l test.appstudio.openshift.io/type=multi-version-build \
+    -o json 2>/dev/null)
 
 # Process all components created by this script
 # Format: component_name:app_name (matches how we write to COMPONENT_LIST)
@@ -2025,51 +2548,69 @@ while IFS=: read -r component_name app_name; do
     [ -z "$component_name" ] && continue
     [ -z "$app_name" ] && continue
     
-    # Check if this component was actually rebuilt (has PipelineRuns from this run)
-    # Components that were reused (not rebuilt) don't need patching - they already have valid digests
-    plr_count=$(kubectl get pipelinerun -n "${NAMESPACE}" \
-        -l "appstudio.openshift.io/component=${component_name}" \
-        -l "pipelines.appstudio.openshift.io/type=build" \
-        --no-headers 2>/dev/null | wc -l || echo "0")
+    # Extract component data from batch query
+    comp_data=$(echo "${ALL_COMPONENT_DATA}" | jq -r --arg name "${component_name}" \
+        '.items[] | select(.metadata.name == $name)')
     
-    if [ "$plr_count" -eq 0 ]; then
-        # Component wasn't rebuilt - skip patching (already has valid digest from previous run)
-        log_info "   ⏭️  ${component_name}: Skipped (reused from previous run)"
+    if [ -z "$comp_data" ] || [ "$comp_data" == "null" ]; then
+        log_warning "   ⚠️  ${component_name}: Component not found"
+        PATCH_FAILED=$((PATCH_FAILED + 1))
+        continue
+    fi
+    
+    # Get current spec.containerImage
+    current_spec_image=$(echo "$comp_data" | jq -r '.spec.containerImage // ""')
+    
+    # Try to get digest from status.lastPromotedImage (primary source - set by successful builds)
+    status_image=$(echo "$comp_data" | jq -r '.status.lastPromotedImage // ""')
+    
+    # Determine the digest to use
+    image_with_digest=""
+    source="unknown"
+    
+    if [ -n "$status_image" ] && [[ "$status_image" == *"@sha256:"* ]]; then
+        # Primary: Use status.lastPromotedImage (most reliable - set by Konflux after build)
+        image_with_digest="$status_image"
+        source="status"
+    elif [ -n "$current_spec_image" ] && [[ "$current_spec_image" == *"@sha256:"* ]]; then
+        # Already has digest in spec - nothing to do
+        log_info "   ✅ ${component_name}: Already has digest in spec"
+        ALREADY_CORRECT=$((ALREADY_CORRECT + 1))
+        continue
+    else
+        # Fallback: Try Quay API (slower, but handles edge cases)
+        base="quay.io/redhat-user-workloads-stage/${NAMESPACE}/${component_name}"
+        digest_tag=$(timeout 10 skopeo list-tags docker://${base} 2>/dev/null | \
+            jq -r '[.Tags[] | select(startswith("sha256-") and
+            ((endswith(".att") or endswith(".sig") or
+             endswith(".sbom") or endswith(".dockerfile")) | not))][0] // ""' 2>/dev/null)
+        
+        if [ -n "$digest_tag" ]; then
+            digest="sha256:${digest_tag#sha256-}"
+            image_with_digest="${base}@${digest}"
+            source="quay"
+        else
+            log_info "   ⏭️  ${component_name}: No image found yet (build may be in progress)"
+            SKIPPED_NO_IMAGE=$((SKIPPED_NO_IMAGE + 1))
+            continue
+        fi
+    fi
+    
+    # Check if spec already has the correct digest
+    if [[ "$current_spec_image" == "$image_with_digest" ]]; then
+        log_info "   ✅ ${component_name}: Already correct"
         ALREADY_CORRECT=$((ALREADY_CORRECT + 1))
         continue
     fi
     
-    base="quay.io/redhat-user-workloads-stage/${NAMESPACE}/${component_name}"
-    
-    # Get sha256-* tag from Quay (excluding .sig, .att, .sbom, .dockerfile)
-    digest_tag=$(skopeo list-tags docker://${base} 2>/dev/null | \
-        jq -r '[.Tags[] | select(startswith("sha256-") and
-        ((endswith(".att") or endswith(".sig") or
-         endswith(".sbom") or endswith(".dockerfile")) | not))][0] // ""' 2>/dev/null)
-    
-    if [ -n "$digest_tag" ]; then
-        digest="sha256:${digest_tag#sha256-}"
-        
-        # Check if component already has this digest
-        current_image=$(kubectl get component ${component_name} -n ${NAMESPACE} \
-            -o jsonpath='{.spec.containerImage}' 2>/dev/null || echo "")
-        
-        if [[ "$current_image" == *"@${digest}" ]]; then
-            log_info "   ✅ ${component_name}: Already has correct digest"
-            ALREADY_CORRECT=$((ALREADY_CORRECT + 1))
-        else
-            log_info "   🔧 ${component_name}: Patching with ${digest:0:19}..."
-            if kubectl patch component ${component_name} -n ${NAMESPACE} \
-                --type=merge \
-                -p "{\"spec\":{\"containerImage\":\"${base}@${digest}\"}}" &>/dev/null; then
-                PATCHED_COUNT=$((PATCHED_COUNT + 1))
-            else
-                log_warning "   ⚠️  ${component_name}: Patch failed"
-                PATCH_FAILED=$((PATCH_FAILED + 1))
-            fi
-        fi
+    # Patch the component spec
+    log_info "   🔧 ${component_name}: Patching from ${source} (${image_with_digest:0:60}...)"
+    if kubectl patch component ${component_name} -n ${NAMESPACE} \
+        --type=merge \
+        -p "{\"spec\":{\"containerImage\":\"${image_with_digest}\"}}" &>/dev/null; then
+        PATCHED_COUNT=$((PATCHED_COUNT + 1))
     else
-        log_warning "   ⚠️  ${component_name}: No digest found on Quay"
+        log_warning "   ⚠️  ${component_name}: Patch failed"
         PATCH_FAILED=$((PATCH_FAILED + 1))
     fi
 done < "${COMPONENT_LIST}"
@@ -2078,6 +2619,9 @@ echo "" >&2
 log_success "Component patching complete:"
 log_info "   Patched: ${PATCHED_COUNT}"
 log_info "   Already correct: ${ALREADY_CORRECT}"
+if [ ${SKIPPED_NO_IMAGE} -gt 0 ]; then
+    log_info "   No image yet: ${SKIPPED_NO_IMAGE} (builds in progress)"
+fi
 if [ ${PATCH_FAILED} -gt 0 ]; then
     log_warning "   Failed: ${PATCH_FAILED}"
 fi
