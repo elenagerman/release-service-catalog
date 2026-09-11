@@ -376,6 +376,7 @@ spec:
         - check-data-keys
     - name: marketplacesvm-push-disk-images
       timeout: "12h00m0s"
+      onError: continue
       when:
         - input: "$(tasks.apply-mapping.results.mapped)"
           operator: in
@@ -411,7 +412,43 @@ spec:
       runAfter:
         - embargo-check
         - collect-task-params
+    - name: fail-on-marketplace-push-error
+      when:
+        - input: "$(tasks.marketplacesvm-push-disk-images.results.status)"
+          operator: in
+          values: ["Failure"]
+      params:
+        - name: message
+          value: "$(tasks.marketplacesvm-push-disk-images.results.message)"
+      taskSpec:
+        params:
+          - name: message
+            type: string
+        steps:
+          - name: fail
+            image: quay.io/konflux-ci/release-service-utils@sha256:d84bb7da0988c3cbce65ed714beddda4694b9e3201af56a135ac5843a05abe1e
+            computeResources:
+              limits:
+                cpu: 30m
+                memory: 64Mi
+              requests:
+                cpu: 30m
+                memory: 64Mi
+            env:
+              - name: MESSAGE
+                value: $(params.message)
+            script: |
+              #!/usr/bin/env bash
+              set -eu
+              echo "ERROR: marketplacesvm-push-disk-images failed: ${MESSAGE}" >&2
+              exit 1
+      runAfter:
+        - marketplacesvm-push-disk-images
     - name: create-advisory
+      when:
+        - input: "$(tasks.marketplacesvm-push-disk-images.results.status)"
+          operator: in
+          values: ["Success"]
       params:
         - name: releasePlanAdmissionPath
           value: "$(tasks.collect-data.results.releasePlanAdmission)"

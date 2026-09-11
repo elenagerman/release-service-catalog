@@ -357,6 +357,30 @@ run_single_test_item() {
     fi
 }
 
+# Delete Tasks installed for explicit test yaml items. Directory workers
+# already remove their Task; file workers skip that delete so siblings can
+# keep using the same Task until this caller finishes.
+cleanup_shared_tasks() {
+    local item task_name
+    local -a task_names=()
+    for item in "$@"; do
+        if [[ "${item}" != *tests/test-*.yaml ]]; then
+            continue
+        fi
+        task_name="$(basename "$(dirname "$(dirname "${item}")")")"
+        task_names+=("${task_name}")
+    done
+    if [ "${#task_names[@]}" -eq 0 ]; then
+        return 0
+    fi
+    readarray -t task_names < <(printf '%s\n' "${task_names[@]}" | sort -u)
+    for task_name in "${task_names[@]}"; do
+        log "Cleaning up shared task ${task_name}"
+        kubectl delete task "${task_name}" --ignore-not-found=true \
+            || warn "Failed to delete task ${task_name}"
+    done
+}
+
 run_tests_parallel() {
     local force_workflow="$1"
     local trusted_artifacts_tasks="$2"
@@ -401,10 +425,16 @@ run_tests_parallel() {
     esac
     
     # Execute tests in parallel using xargs pattern
-    printf '%s\n' "${parallel_items[@]}" | xargs -I {} -P "$max_parallel" bash -c "run_single_test_item_${function_suffix} {}" _
-    
+    local xargs_status=0
+    printf '%s\n' "${parallel_items[@]}" | xargs -I {} -P "$max_parallel" bash -c "run_single_test_item_${function_suffix} {}" _ \
+        || xargs_status="${?}"
+
     # Cleanup exported functions
     unset -f "run_single_test_item_${function_suffix}"
+
+    cleanup_shared_tasks "${test_items[@]}"
+
+    return "${xargs_status}"
 }
 
 generate_test_summary() {
@@ -502,6 +532,9 @@ run_tests() {
         done
         return 0
     fi
+
+    SHARED_TASK_CLEANUP_ITEMS=("${test_items[@]}")
+    trap 'cleanup_shared_tasks "${SHARED_TASK_CLEANUP_ITEMS[@]}"; trap - EXIT' EXIT
     
     # Classify tasks by workflow type unless forced
     local workflow_classification
